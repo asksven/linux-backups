@@ -1,0 +1,29 @@
+groups:
+  - name: linux-backups
+    rules:
+      # Fires when the most recent backup run reported failure.
+      - alert: LinuxBackupFailed
+        expr: backup_success{job="linux_backup"} == 0
+        for: 5m
+        labels:
+          severity: critical
+          type: backup
+        annotations:
+          summary: "Backup failed on {{ $labels.instance }}"
+          description: >-
+            The latest backup run on {{ $labels.instance }} reported failure
+            (backup_success=0). Check the last run logs on the host
+            (default /var/backups/linux-backups/logs).
+
+      # Fires when no successful backup has completed for over 25h — also catches
+      # the case where the scheduled job stopped running entirely.
+      - alert: LinuxBackupStale
+        expr: time() - backup_last_success_timestamp_seconds{job="linux_backup"} > 90000
+        labels:
+          severity: critical
+          type: backup
+        annotations:
+          summary: "Backup stale on {{ $labels.instance }}"
+          description: >-
+            No successful backup on {{ $labels.instance }} for more than 25h.
+            The job may be failing or not running at all.

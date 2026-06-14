@@ -1,0 +1,10 @@
+# Local secrets — never commit
+secrets.env
+
+# Per-server config — should live in CONFIG_DIR (e.g. /etc/linux-backups), never commit
+backup.conf
+
+# Backup artifacts and logs
+*.tar.gz
+*.log
+output.txt

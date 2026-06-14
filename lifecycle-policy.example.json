@@ -1,0 +1,58 @@
+{
+  "rules": [
+    {
+      "enabled": true,
+      "name": "srv-1-retention",
+      "type": "Lifecycle",
+      "definition": {
+        "filters": {
+          "blobTypes": ["blockBlob"],
+          "prefixMatch": ["backups/srv-1/"]
+        },
+        "actions": {
+          "baseBlob": {
+            "delete": {
+              "daysAfterModificationGreaterThan": 30
+            }
+          }
+        }
+      }
+    },
+    {
+      "enabled": true,
+      "name": "infra-1-retention",
+      "type": "Lifecycle",
+      "definition": {
+        "filters": {
+          "blobTypes": ["blockBlob"],
+          "prefixMatch": ["backups/infra-1/"]
+        },
+        "actions": {
+          "baseBlob": {
+            "delete": {
+              "daysAfterModificationGreaterThan": 30
+            }
+          }
+        }
+      }
+    },
+    {
+      "enabled": true,
+      "name": "lab-3-retention",
+      "type": "Lifecycle",
+      "definition": {
+        "filters": {
+          "blobTypes": ["blockBlob"],
+          "prefixMatch": ["backups/lab-3/"]
+        },
+        "actions": {
+          "baseBlob": {
+            "delete": {
+              "daysAfterModificationGreaterThan": 30
+            }
+          }
+        }
+      }
+    }
+  ]
+}
