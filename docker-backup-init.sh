@@ -98,10 +98,12 @@ report_stack_volumes() {
 }
 
 # Print uncovered bind mounts (candidates for BIND_IGNORE / INCLUDE_PATHS) for a
-# stack, with their on-disk size. Returns the number printed via UNCOVERED_PRINTED.
+# stack, with their on-disk size, then a paste-ready suggestion listing the exact
+# paths to add. Returns the number printed via UNCOVERED_PRINTED.
 report_stack_binds() {
   local stack="$1" src dst
   UNCOVERED_PRINTED=0
+  local paths=() p
   while IFS=$'\t' read -r src dst; do
     [[ -n "$src" ]] || continue
     already_ignored "$stack" "$src" && continue
@@ -113,8 +115,20 @@ report_stack_binds() {
     else
       printf '      bind (coverage unknown): %s (%s) -> %s\n' "$src" "$(dir_size_human "$src")" "$dst"
     fi
+    paths+=( "$src" )
     UNCOVERED_PRINTED=$((UNCOVERED_PRINTED + 1))
   done < <(stack_bind_mounts "$stack")
+
+  if [[ ${#paths[@]} -gt 0 ]]; then
+    printf '      => back these up by adding to INCLUDE_PATHS in backup.conf:\n'
+    for p in "${paths[@]}"; do
+      printf '           %q\n' "$p"
+    done
+    printf '         (or, if a path is transient, add it to BIND_IGNORE in docker-backup.conf:)\n'
+    for p in "${paths[@]}"; do
+      printf '           %q\n' "${stack}:${p}"
+    done
+  fi
 }
 
 # Append STACKS entries under a dated, clearly-marked block.
