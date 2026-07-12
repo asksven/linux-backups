@@ -20,6 +20,24 @@
     },
     {
       "enabled": true,
+      "name": "srv-1-docker-retention",
+      "type": "Lifecycle",
+      "definition": {
+        "filters": {
+          "blobTypes": ["blockBlob"],
+          "prefixMatch": ["backups/srv-1/docker/"]
+        },
+        "actions": {
+          "baseBlob": {
+            "delete": {
+              "daysAfterModificationGreaterThan": 30
+            }
+          }
+        }
+      }
+    },
+    {
+      "enabled": true,
       "name": "infra-1-retention",
       "type": "Lifecycle",
       "definition": {
@@ -44,6 +62,42 @@
         "filters": {
           "blobTypes": ["blockBlob"],
           "prefixMatch": ["backups/lab-3/"]
+        },
+        "actions": {
+          "baseBlob": {
+            "delete": {
+              "daysAfterModificationGreaterThan": 30
+            }
+          }
+        }
+      }
+    },
+    {
+      "enabled": true,
+      "name": "media-1-retention",
+      "type": "Lifecycle",
+      "definition": {
+        "filters": {
+          "blobTypes": ["blockBlob"],
+          "prefixMatch": ["backups/media-1/"]
+        },
+        "actions": {
+          "baseBlob": {
+            "delete": {
+              "daysAfterModificationGreaterThan": 30
+            }
+          }
+        }
+      }
+    },
+        {
+      "enabled": true,
+      "name": "agents-1-retention",
+      "type": "Lifecycle",
+      "definition": {
+        "filters": {
+          "blobTypes": ["blockBlob"],
+          "prefixMatch": ["backups/agents-1/"]
         },
         "actions": {
           "baseBlob": {

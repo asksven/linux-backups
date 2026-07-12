@@ -140,7 +140,7 @@
     },
     {
       "id": 5,
-      "title": "Exit codes by node (tar / azcopy)",
+      "title": "Backup health by node (tar rc / all targets)",
       "type": "table",
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 14 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
@@ -155,7 +155,7 @@
         },
         {
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "backup_azcopy_rc{job=\"linux_backup\"}",
+          "expr": "backup_all_targets_success{job=\"linux_backup\"}",
           "legendFormat": "{{instance}}",
           "instant": true,
           "format": "table",
@@ -171,7 +171,222 @@
             "renameByName": {
               "instance": "Node",
               "Value #A": "tar rc",
-              "Value #B": "azcopy rc"
+              "Value #B": "all targets ok"
+            }
+          }
+        }
+      ],
+      "options": { "showHeader": true }
+    },
+    {
+      "id": 6,
+      "title": "Docker stack backup status",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 22 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "docker_backup_success{job=\"docker_backup\"}",
+          "legendFormat": "{{instance}} / {{stack}}",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "FAILED", "color": "red" } } },
+            { "type": "value", "options": { "1": { "text": "OK", "color": "green" } } }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 7,
+      "title": "Hours since last successful stack backup",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 22 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "(time() - docker_backup_last_success_timestamp_seconds{job=\"docker_backup\"}) / 3600",
+          "legendFormat": "{{instance}} / {{stack}}",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "h",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 24 },
+              { "color": "red", "value": 25 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 8,
+      "title": "Stack backup downtime (stop-cold-copy)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "docker_backup_stop_seconds{job=\"docker_backup\"}",
+          "legendFormat": "{{instance}} / {{stack}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 9,
+      "title": "Stack backup size",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "docker_backup_size_bytes{job=\"docker_backup\"}",
+          "legendFormat": "{{instance}} / {{stack}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 10,
+      "title": "Unmanaged stacks & uncovered bind mounts",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 36 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "docker_backup_unmanaged_stacks{job=\"docker_backup\"}",
+          "legendFormat": "{{instance}}",
+          "instant": true,
+          "format": "table",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "docker_backup_uncovered_bind_mounts{job=\"docker_backup\"}",
+          "legendFormat": "{{instance}} / {{stack}}",
+          "instant": true,
+          "format": "table",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "docker_backup_ignored_bind_mounts{job=\"docker_backup\"}",
+          "legendFormat": "{{instance}} / {{stack}}",
+          "instant": true,
+          "format": "table",
+          "refId": "C"
+        }
+      ],
+      "transformations": [
+        { "id": "merge", "options": {} },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "job": true, "__name__": true },
+            "renameByName": {
+              "instance": "Node",
+              "stack": "Stack",
+              "Value #A": "unmanaged stacks",
+              "Value #B": "uncovered binds",
+              "Value #C": "ignored binds"
+            }
+          }
+        }
+      ],
+      "options": { "showHeader": true }
+    },
+    {
+      "id": 11,
+      "title": "Backup target delivery (node × target)",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 44 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "backup_target_success{job=\"linux_backup\"}",
+          "legendFormat": "{{instance}} / {{target}}",
+          "instant": true,
+          "format": "table",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "backup_target_rc{job=\"linux_backup\"}",
+          "legendFormat": "{{instance}} / {{target}}",
+          "instant": true,
+          "format": "table",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "backup_target_pruned_files{job=\"linux_backup\"}",
+          "legendFormat": "{{instance}} / {{target}}",
+          "instant": true,
+          "format": "table",
+          "refId": "C"
+        }
+      ],
+      "transformations": [
+        { "id": "merge", "options": {} },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "job": true, "__name__": true },
+            "renameByName": {
+              "instance": "Node",
+              "target": "Target",
+              "Value #A": "delivered",
+              "Value #B": "rc",
+              "Value #C": "pruned"
             }
           }
         }

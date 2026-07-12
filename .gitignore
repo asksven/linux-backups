@@ -3,6 +3,13 @@ secrets.env
 
 # Per-server config — should live in CONFIG_DIR (e.g. /etc/linux-backups), never commit
 backup.conf
+docker-backup.conf
+docker-backup.conf.bak-*
+
+# Per-target backup configs (may hold SAS tokens / ssh key paths) — never commit
+# the real ones; the *.example.conf templates are kept.
+conf/targets/*.conf
+!conf/targets/*.example.conf
 
 # Backup artifacts and logs
 *.tar.gz
