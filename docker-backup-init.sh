@@ -87,11 +87,14 @@ already_ignored() {
 
 # Print a stack's named volumes with their on-disk sizes.
 report_stack_volumes() {
-  local stack="$1" name mp
+  local stack="$1" name mp count=0
   while IFS=$'\t' read -r name mp; do
     [[ -n "$name" ]] || continue
     printf '      volume %s: %s\n' "$name" "$(dir_size_human "$mp")"
+    count=$((count + 1))
   done < <(stack_volumes "$stack")
+  [[ $count -eq 0 ]] && printf '      (no named volumes — state is in bind mounts)\n'
+  return 0
 }
 
 # Print uncovered bind mounts (candidates for BIND_IGNORE / INCLUDE_PATHS) for a
@@ -157,26 +160,30 @@ main() {
   load_coverage
 
   local conf="$CONFIG_DIR/docker-backup.conf"
-  local stateful=() name
-  mapfile -t stateful < <(discover_stateful_stacks)
+  local projects=() name
+  mapfile -t projects < <(discover_compose_projects)
 
   echo "Node compose landscape:"
-  echo "  stateful stacks (own named volumes): ${stateful[*]:-<none>}"
+  echo "  compose projects: ${projects[*]:-<none>}"
   echo "  config: $conf ($([[ -e "$conf" ]] && echo present || echo missing))"
   echo
 
   # ----- Case 1: no config yet -> bootstrap -----
   if [[ ! -e "$conf" ]]; then
-    if [[ ${#stateful[@]} -eq 0 ]]; then
-      log INFO "no stateful stacks found; nothing to bootstrap"
+    if [[ ${#projects[@]} -eq 0 ]]; then
+      log INFO "no compose projects found; nothing to bootstrap"
     fi
     declare -a BIND_IGNORE=()
     local chosen=()
-    for name in "${stateful[@]:-}"; do
+    for name in "${projects[@]:-}"; do
       [[ -n "$name" ]] || continue
-      echo "  stack: $name"
+      echo "  project: $name"
       report_stack_volumes "$name"
       report_stack_binds "$name"
+      if ! stack_has_named_volumes "$name"; then
+        echo "      (bind-only: cover its bind mounts via INCLUDE_PATHS in backup.conf, not STACKS)"
+        continue
+      fi
       case "$MODE" in
         write) chosen+=( "$name" ) ;;
         print) : ;;
@@ -199,26 +206,32 @@ main() {
   [[ -n "${STACKS+x}" ]] || STACKS=()
   [[ -n "${BIND_IGNORE+x}" ]] || BIND_IGNORE=()
 
-  local unmanaged=() gone=() s found
-  for name in "${stateful[@]:-}"; do
+  local unmanaged=() bindonly=() gone=() s found
+  for name in "${projects[@]:-}"; do
     [[ -n "$name" ]] || continue
     found=0
     for s in "${STACKS[@]:-}"; do [[ "$s" == "$name" ]] && found=1 && break; done
-    [[ $found -eq 0 ]] && unmanaged+=( "$name" )
+    [[ $found -eq 1 ]] && continue
+    if stack_has_named_volumes "$name"; then
+      unmanaged+=( "$name" )
+    else
+      bindonly+=( "$name" )
+    fi
   done
   for s in "${STACKS[@]:-}"; do
     [[ -n "$s" ]] || continue
     found=0
-    for name in "${stateful[@]:-}"; do [[ "$s" == "$name" ]] && found=1 && break; done
+    for name in "${projects[@]:-}"; do [[ "$s" == "$name" ]] && found=1 && break; done
     [[ $found -eq 0 ]] && gone+=( "$s" )
   done
 
   echo "Reconciliation report:"
   echo "  managed stacks: ${STACKS[*]:-<none>}"
-  echo "  running but UNMANAGED: ${unmanaged[*]:-<none>}"
+  echo "  running but UNMANAGED (own volumes): ${unmanaged[*]:-<none>}"
+  echo "  bind-only projects (cover via INCLUDE_PATHS): ${bindonly[*]:-<none>}"
   echo "  configured but GONE (down/renamed?): ${gone[*]:-<none>}"
-  echo "  stack details (volume & bind sizes):"
-  for name in "${stateful[@]:-}"; do
+  echo "  project details (volume & bind sizes):"
+  for name in "${projects[@]:-}"; do
     [[ -n "$name" ]] || continue
     echo "    $name:"
     report_stack_volumes "$name"
@@ -231,7 +244,7 @@ main() {
   fi
 
   if [[ ${#unmanaged[@]} -eq 0 ]]; then
-    log INFO "no unmanaged stateful stacks; config is in sync"
+    log INFO "no unmanaged stacks that own named volumes; config is in sync"
     return 0
   fi
 

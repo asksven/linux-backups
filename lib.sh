@@ -422,11 +422,22 @@ require_docker() {
   fi
 }
 
-# Print the unique compose project names that own at least one named volume
-# (i.e. stacks that hold persistent state), one per line, sorted.
-discover_stateful_stacks() {
-  docker volume ls --format '{{ .Label "com.docker.compose.project" }}' 2>/dev/null \
+# Print all compose project names present on the host — any container carrying
+# the com.docker.compose.project label (running or stopped), one per line, sorted.
+# This includes stacks that keep their state only in bind mounts (no named
+# volumes), so their bind mounts still get coverage-checked.
+discover_compose_projects() {
+  docker ps -a --filter "label=com.docker.compose.project" \
+    --format '{{ .Label "com.docker.compose.project" }}' 2>/dev/null \
     | awk 'NF' | sort -u
+}
+
+# Return 0 if <stack> owns at least one compose-labeled named volume.
+stack_has_named_volumes() {
+  local stack="$1" first
+  first="$(docker volume ls --filter "label=com.docker.compose.project=$stack" \
+    --format '{{ .Name }}' 2>/dev/null | awk 'NF' | head -n 1)"
+  [[ -n "$first" ]]
 }
 
 # Print "<volume-name>\t<mountpoint>" for each named volume owned by <stack>.

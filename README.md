@@ -283,7 +283,7 @@ databases consistent without any dump tooling it uses **stop-cold-copy**: it run
 There is therefore a brief per-stack downtime while the archive is built.
 
 ```
-discover stateful stacks  ->  for each allowlisted stack:
+discover compose projects  ->  for each allowlisted stack:
   docker compose stop  ->  tar volumes + manifest  ->  docker compose start
       ->  verify (gzip -t)  ->  purge local old  ->  azcopy copy  ->  push metrics
 ```
@@ -331,6 +331,11 @@ Each reported stack lists its named volumes and bind mounts with their **on-disk
 size** (`du`) so you can judge what is worth backing up. (A volume shows `?` when
 its mountpoint is not host-accessible, e.g. on Docker Desktop.)
 
+Discovery covers **all** compose projects (via the `com.docker.compose.project`
+container label), not just those that own named volumes. A project that keeps its
+state only in **bind mounts** is listed too, with a note to cover it via
+`INCLUDE_PATHS` in `backup.conf` (there are no named volumes to stop-cold-copy).
+
 ### Scheduling
 
 Give the compose backup its own cron entry (it self-updates like `backup.sh`):
@@ -360,7 +365,8 @@ allowlist. Instead it **detects and alerts**:
 - **Unmanaged stacks** — a running stack that owns named volumes but isn't on the
   allowlist raises `docker_backup_unmanaged_stacks` (alert `DockerBackupUnmanagedStack`).
 - **Uncovered bind mounts** — compose stacks often keep state in host bind mounts.
-  For every stack the script inspects its bind mounts, filters ephemeral ones
+  For every compose project on the host (including stacks with **no** named
+  volumes) the script inspects its bind mounts, filters ephemeral ones
   (`docker.sock`, `/etc/localtime`, …), and checks the rest against the host-path
   backup (`INCLUDE_PATHS` in `backup.conf`). A bind that is neither covered nor
   acknowledged raises `docker_backup_uncovered_bind_mounts` (alert

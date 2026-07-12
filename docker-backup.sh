@@ -530,9 +530,9 @@ main() {
 
   log INFO "starting docker-compose backup for node '${NODE_NAME}'"
 
-  local stateful=()
-  mapfile -t stateful < <(discover_stateful_stacks)
-  log INFO "discovered ${#stateful[@]} stateful stack(s): ${stateful[*]:-<none>}"
+  local projects=()
+  mapfile -t projects < <(discover_compose_projects)
+  log INFO "discovered ${#projects[@]} compose project(s): ${projects[*]:-<none>}"
 
   # Initialize BIND_IGNORE hit tracking.
   local i
@@ -544,8 +544,8 @@ main() {
   # Back up managed stacks (or, in dry-run, evaluate them without downtime).
   for s in "${STACKS[@]:-}"; do
     [[ -n "$s" ]] || continue
-    if ! printf '%s\n' "${stateful[@]:-}" | grep -qxF "$s"; then
-      log WARNING "configured stack '$s' has no live named volumes (down or renamed?)"
+    if ! printf '%s\n' "${projects[@]:-}" | grep -qxF "$s"; then
+      log WARNING "configured stack '$s' is not a running compose project (down or renamed?)"
     fi
     if [[ -n "${DRY_RUN:-}" ]]; then
       mapfile -t VOL_LINES < <(stack_volumes "$s")
@@ -558,16 +558,19 @@ main() {
     fi
   done
 
-  # Detect unmanaged stateful stacks + analyze their binds (alert only).
+  # Analyze binds for every non-managed project; only count as "unmanaged
+  # stateful" those that own named volumes (i.e. something for stop-cold-copy).
   UNMANAGED_COUNT=0
-  for s in "${stateful[@]:-}"; do
+  for s in "${projects[@]:-}"; do
     [[ -n "$s" ]] || continue
-    if is_managed "$s"; then
-      continue
-    fi
-    UNMANAGED_COUNT=$((UNMANAGED_COUNT + 1))
-    log WARNING "UNMANAGED stateful stack (not in STACKS): $s"
+    is_managed "$s" && continue
     analyze_stack_binds "$s"
+    if stack_has_named_volumes "$s"; then
+      UNMANAGED_COUNT=$((UNMANAGED_COUNT + 1))
+      log WARNING "UNMANAGED stateful stack (owns named volumes, not in STACKS): $s"
+    else
+      log INFO "compose project '$s' has no named volumes (state in bind mounts); bind coverage checked"
+    fi
     push_stack_metrics "$s" 0 0 0 0 0 0 0 0 "$UNCOVERED_BINDS" "$IGNORED_BINDS"
   done
 
