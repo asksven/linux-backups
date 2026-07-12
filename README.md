@@ -327,14 +327,18 @@ With no config it offers to create one from the discovered stacks. With an
 existing config it reports stacks that are **running but unmanaged**,
 **configured but gone**, and **bind mounts nothing backs up**, and can append the
 missing stacks (additively, after backing your file up to `docker-backup.conf.bak-<ts>`).
-Each reported stack lists its named volumes and bind mounts with their **on-disk
-size** (`du`) so you can judge what is worth backing up. (A volume shows `?` when
-its mountpoint is not host-accessible, e.g. on Docker Desktop.)
+Each reported stack lists its named volumes and each writable bind mount with its
+**on-disk size** (`du`) and a **coverage status** (`[covered]` / `[UNCOVERED]` /
+`[ignored]`), plus a paste-ready list of any uncovered paths to add to
+`INCLUDE_PATHS`. (A volume shows `?` when its mountpoint is not host-accessible,
+e.g. on Docker Desktop.)
 
 Discovery covers **all** compose projects (via the `com.docker.compose.project`
-container label), not just those that own named volumes. A project that keeps its
-state only in **bind mounts** is listed too, with a note to cover it via
-`INCLUDE_PATHS` in `backup.conf` (there are no named volumes to stop-cold-copy).
+container label), and a stack's named volumes are detected from its **container
+mounts** — so `external:` / unlabeled volumes are found too, not just
+compose-labelled ones. A project that keeps its state only in **bind mounts** is
+listed with a note to cover it via `INCLUDE_PATHS` in `backup.conf` (there are no
+named volumes to stop-cold-copy).
 
 ### Scheduling
 

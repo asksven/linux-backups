@@ -97,36 +97,34 @@ report_stack_volumes() {
   return 0
 }
 
-# Print uncovered bind mounts (candidates for BIND_IGNORE / INCLUDE_PATHS) for a
-# stack, with their on-disk size, then a paste-ready suggestion listing the exact
-# paths to add. Returns the number printed via UNCOVERED_PRINTED.
+# Print each of a stack's writable bind mounts with its coverage status and
+# on-disk size, then a paste-ready list of the paths still needing coverage.
+# (stack_bind_mounts already drops read-only and ephemeral binds.)
 report_stack_binds() {
-  local stack="$1" src dst
+  local stack="$1" src dst status any=0
   UNCOVERED_PRINTED=0
-  local paths=() p
+  local uncovered=() p
   while IFS=$'\t' read -r src dst; do
     [[ -n "$src" ]] || continue
-    already_ignored "$stack" "$src" && continue
-    if [[ $HAVE_COVERAGE -eq 1 ]] && path_is_covered "$src"; then
-      continue
-    fi
-    if [[ $HAVE_COVERAGE -eq 1 ]]; then
-      printf '      uncovered bind: %s (%s) -> %s\n' "$src" "$(dir_size_human "$src")" "$dst"
+    any=1
+    if already_ignored "$stack" "$src"; then
+      status="ignored"
+    elif [[ $HAVE_COVERAGE -eq 1 ]] && path_is_covered "$src"; then
+      status="covered"
+    elif [[ $HAVE_COVERAGE -eq 1 ]]; then
+      status="UNCOVERED"; uncovered+=( "$src" ); UNCOVERED_PRINTED=$((UNCOVERED_PRINTED + 1))
     else
-      printf '      bind (coverage unknown): %s (%s) -> %s\n' "$src" "$(dir_size_human "$src")" "$dst"
+      status="coverage-unknown"; uncovered+=( "$src" ); UNCOVERED_PRINTED=$((UNCOVERED_PRINTED + 1))
     fi
-    paths+=( "$src" )
-    UNCOVERED_PRINTED=$((UNCOVERED_PRINTED + 1))
+    printf '      bind [%s] %s (%s) -> %s\n' "$status" "$src" "$(dir_size_human "$src")" "$dst"
   done < <(stack_bind_mounts "$stack")
 
-  if [[ ${#paths[@]} -gt 0 ]]; then
-    printf '      => back these up by adding to INCLUDE_PATHS in backup.conf:\n'
-    for p in "${paths[@]}"; do
+  [[ $any -eq 0 ]] && printf '      (no writable bind mounts)\n'
+
+  if [[ ${#uncovered[@]} -gt 0 ]]; then
+    printf '      => add these to INCLUDE_PATHS in backup.conf (or BIND_IGNORE if transient):\n'
+    for p in "${uncovered[@]}"; do
       printf '           %q\n' "$p"
-    done
-    printf '         (or, if a path is transient, add it to BIND_IGNORE in docker-backup.conf:)\n'
-    for p in "${paths[@]}"; do
-      printf '           %q\n' "${stack}:${p}"
     done
   fi
 }
@@ -195,7 +193,8 @@ main() {
       report_stack_volumes "$name"
       report_stack_binds "$name"
       if ! stack_has_named_volumes "$name"; then
-        echo "      (bind-only: cover its bind mounts via INCLUDE_PATHS in backup.conf, not STACKS)"
+        # No named volumes to stop-cold-copy; cover any UNCOVERED binds above
+        # via INCLUDE_PATHS in backup.conf instead of adding to STACKS.
         continue
       fi
       case "$MODE" in

@@ -432,23 +432,29 @@ discover_compose_projects() {
     | awk 'NF' | sort -u
 }
 
-# Return 0 if <stack> owns at least one compose-labeled named volume.
+# Return 0 if <stack> has at least one named volume mounted by its containers
+# (label-independent — catches external/unlabeled volumes too).
 stack_has_named_volumes() {
-  local stack="$1" first
-  first="$(docker volume ls --filter "label=com.docker.compose.project=$stack" \
-    --format '{{ .Name }}' 2>/dev/null | awk 'NF' | head -n 1)"
+  local first
+  first="$(stack_volumes "$1" | head -n 1)"
   [[ -n "$first" ]]
 }
 
-# Print "<volume-name>\t<mountpoint>" for each named volume owned by <stack>.
+# Print "<volume-name>\t<mountpoint>" for each named volume mounted by any
+# container of <stack>. Derived from the containers' .Mounts (not from volume
+# labels), so it also finds volumes declared `external:` / created out-of-band.
 stack_volumes() {
-  local stack="$1" v mp
-  while IFS= read -r v; do
-    [[ -n "$v" ]] || continue
-    mp="$(docker volume inspect "$v" --format '{{ .Mountpoint }}' 2>/dev/null || true)"
-    printf '%s\t%s\n' "$v" "$mp"
-  done < <(docker volume ls --filter "label=com.docker.compose.project=$stack" \
-    --format '{{ .Name }}' 2>/dev/null)
+  local stack="$1" cid type name src
+  while IFS= read -r cid; do
+    [[ -n "$cid" ]] || continue
+    while IFS=$'\t' read -r type name src; do
+      [[ "$type" == "volume" ]] || continue
+      [[ -n "$name" ]] || continue
+      printf '%s\t%s\n' "$name" "$src"
+    done < <(docker inspect "$cid" \
+      --format '{{ range .Mounts }}{{ .Type }}{{ "\t" }}{{ .Name }}{{ "\t" }}{{ .Source }}{{ "\n" }}{{ end }}' \
+      2>/dev/null)
+  done < <(stack_containers "$stack") | sort -u
 }
 
 # Print the container IDs belonging to <stack> (running or stopped).
