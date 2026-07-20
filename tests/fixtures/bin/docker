@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# =============================================================================
+# tests/fixtures/bin/docker — minimal `docker` CLI stub for restore.sh
+# contract tests that run restore.sh as a real subprocess (so bash-function
+# overrides don't apply). Implements only the subset restore.sh's volume
+# restore path actually calls: `docker info`, `docker volume inspect [--format
+# ...] <name>`, `docker volume create <name>`.
+#
+# State (which volumes "exist" and their mountpoint) lives under
+# $DOCKER_STUB_STATE/volumes/<name>/, which doubles as the fake mountpoint
+# directory restore.sh extracts into -- a real, writable directory, so
+# extracted content can be asserted on directly by the caller.
+# =============================================================================
+set -euo pipefail
+
+: "${DOCKER_STUB_STATE:?DOCKER_STUB_STATE must be set for the docker stub}"
+mkdir -p "$DOCKER_STUB_STATE/volumes"
+
+case "${1:-}" in
+  info)
+    exit 0
+    ;;
+  volume)
+    case "${2:-}" in
+      inspect)
+        shift 2
+        fmt=""
+        name=""
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --format) fmt="$2"; shift 2 ;;
+            *) name="$1"; shift ;;
+          esac
+        done
+        vdir="$DOCKER_STUB_STATE/volumes/$name"
+        [[ -d "$vdir" ]] || exit 1
+        [[ -n "$fmt" ]] && printf '%s\n' "$vdir"
+        exit 0
+        ;;
+      create)
+        name="${3:?docker volume create needs a name}"
+        mkdir -p "$DOCKER_STUB_STATE/volumes/$name"
+        printf '%s\n' "$name"
+        exit 0
+        ;;
+      *)
+        echo "docker stub: unsupported 'docker volume ${2:-}'" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  *)
+    echo "docker stub: unsupported command 'docker ${1:-}'" >&2
+    exit 1
+    ;;
+esac

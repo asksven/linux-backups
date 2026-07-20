@@ -95,20 +95,6 @@ groups:
             but are not in the backup allowlist. Run docker-backup-init.sh to add or
             review them.
 
-      # Fires when a stack has a bind mount holding state that nothing backs up.
-      - alert: DockerBackupUncoveredBindMount
-        expr: docker_backup_uncovered_bind_mounts{job="docker_backup"} > 0
-        for: 30m
-        labels:
-          severity: warning
-          type: backup
-        annotations:
-          summary: "Uncovered bind mount(s): {{ $labels.stack }} on {{ $labels.instance }}"
-          description: >-
-            Stack {{ $labels.stack }} on {{ $labels.instance }} has {{ $value }} bind
-            mount(s) not covered by the host-path backup and not acknowledged in
-            BIND_IGNORE. Cover them (INCLUDE_PATHS) or acknowledge them.
-
       # Fires when a stack archive was not delivered to a specific target.
       - alert: DockerBackupTargetFailed
         expr: docker_backup_target_success{job="docker_backup"} == 0

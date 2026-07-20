@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # =============================================================================
-# docker-backup.sh — back up Docker Compose stack state (named volumes) as
-# per-stack archives, using stop-cold-copy for consistency.
+# docker-backup.sh — back up Docker Compose stack state (named volumes, compose
+# files, and bind-mounted data) as per-stack archives, using stop-cold-copy for
+# consistency.
 #
 # Flow:
 #   1. Self-update from git (default branch "main", override with --branch).
-#   2. Load secrets + docker-backup.conf (and backup.conf for bind coverage).
-#   3. Discover stacks that own named volumes (com.docker.compose.project label).
+#   2. Load secrets + docker-backup.conf.
+#   3. Discover stacks that own named volumes or non-ephemeral bind mounts
+#      (com.docker.compose.project label).
 #   4. For each stack on the STACKS allowlist:
-#        docker compose stop -> tar each volume into volumes/<vol>/ + manifest
-#        -> docker compose start -> verify -> purge local -> azcopy copy.
-#   5. Detect stateful stacks NOT on the allowlist (alert only, never auto-add)
-#      and check every stack's bind mounts against the host-path backup.
+#        docker compose stop -> tar each volume into volumes/<vol>/, capture
+#        compose files into compose/, capture bind mounts into binds/, write
+#        manifest -> docker compose start -> verify -> purge local -> azcopy copy.
+#   5. Detect stateful stacks NOT on the allowlist (alert only, never auto-add).
 #   6. Push per-stack + detector metrics to the Pushgateway.
 #
 # Usage:
@@ -41,10 +43,19 @@ source "$REPO_DIR/lib.sh"
 # -----------------------------------------------------------------------------
 NODE_NAME=""
 LOG_DIR=""
-HAVE_COVERAGE=0
 UNMANAGED_COUNT=0
+FAILED_STACKS=0
 declare -a VOL_LINES=()
 declare -A BIND_IGNORE_HITS=()
+declare -a CAPTURE_BINDS=()
+declare -a EXCLUDED_BINDS=()
+declare -a COMPOSE_FILE_ENTRIES=()
+
+# Per-stack restart guard: while non-empty, a stack has been stopped for
+# backup and has not yet had a start attempt run. See restart_guard_run().
+RESTART_GUARD_STACK=""
+RESTART_GUARD_WD=""
+RESTART_GUARD_CF=""
 
 # -----------------------------------------------------------------------------
 # Argument parsing
@@ -65,25 +76,14 @@ parse_args() {
 }
 
 # -----------------------------------------------------------------------------
-# Configuration loading. docker-backup.conf is required; backup.conf is optional
-# and only used to judge bind-mount coverage (INCLUDE_PATHS / EXCLUDE_PATHS).
+# Configuration loading. docker-backup.conf is required; no longer reads
+# backup.conf or INCLUDE_PATHS — the docker backup is self-contained.
 # -----------------------------------------------------------------------------
 load_config() {
   local secrets="$CONFIG_DIR/secrets.env"
-  local host_conf="$CONFIG_DIR/backup.conf"
   local conf="$CONFIG_DIR/docker-backup.conf"
 
   load_secrets "$secrets"
-
-  if [[ -r "$host_conf" ]]; then
-    # shellcheck disable=SC1090
-    source "$host_conf"
-    if [[ -n "${INCLUDE_PATHS+x}" ]]; then
-      HAVE_COVERAGE=1
-    fi
-  else
-    log INFO "no backup.conf found; bind-mount coverage will be reported as unknown"
-  fi
 
   if [[ ! -r "$conf" ]]; then
     log ERROR "config file not found or unreadable: $conf"
@@ -97,7 +97,7 @@ load_config() {
   BLOCK_SIZE_MB="${BLOCK_SIZE_MB:-100}"
   STOP_TIMEOUT="${STOP_TIMEOUT:-30}"
   RETENTION_DAYS="${RETENTION_DAYS:-7}"
-  DOCKER_BACKUP_DIR="${DOCKER_BACKUP_DIR:-${BACKUP_DIR:-/var/backups/linux-backups}/docker}"
+  DOCKER_BACKUP_DIR="${DOCKER_BACKUP_DIR:-/var/backups/linux-backups/docker}"
   LOG_DIR="${DOCKER_LOG_DIR:-$DOCKER_BACKUP_DIR/logs}"
 
   # STACKS may legitimately be empty (detection-only run). Ensure it exists.
@@ -106,6 +106,9 @@ load_config() {
   fi
   if [[ -z "${BIND_IGNORE+x}" ]]; then
     BIND_IGNORE=()
+  fi
+  if [[ -z "${BIND_INCLUDE_NETFS+x}" ]]; then
+    BIND_INCLUDE_NETFS=()
   fi
 }
 
@@ -121,53 +124,144 @@ is_managed() {
 }
 
 # -----------------------------------------------------------------------------
-# BIND_IGNORE matching. An entry is either "<pattern>" or "<stack>:<pattern>".
-# <pattern> is an exact path, a directory subtree (trailing "/"), or a glob.
-# _bind_match is provided by lib.sh.
+# Classify a stack's bind mounts using the shared 5-rule precedence decision
+# (bind_capture_verdict, in lib.sh). Populates: CAPTURE_BINDS, EXCLUDED_BINDS
+# (tab-separated fields per entry), deduplicated by source path: identical
+# source data mounted by several containers/destinations is captured/excluded
+# once, with all its destination/RO relationships preserved.
+# Sets:      BIND_COUNT, EXCLUDED_BINDS_COUNT, NETWORK_BINDS_COUNT (all counts
+#            of UNIQUE source paths, not container-mount occurrences).
+#
+# CAPTURE_BINDS entries:  <src>\t<fstype>\t<kind>\t<mounts>
+#   <mounts> is one or more "<dst>\x1f<ro>" records joined by \x1e.
+# EXCLUDED_BINDS entries: <src>\t<dst>\t<fstype>\t<reason>  (first destination
+#   seen for that source; reason/fstype are the same for every mount of a
+#   given source, since the verdict only depends on stack+source).
+# Archive path for entry i is: binds/<i>  (index into CAPTURE_BINDS). <kind>
+# ("file"|"directory"|"unknown") is determined here, before the stack is
+# stopped, so the manifest and the archive both agree on it. BIND_BYTES
+# includes force-captured network binds, since they are archived too.
 # -----------------------------------------------------------------------------
-bind_ignored() {
-  local stack="$1" src="$2" i entry pat scope
-  for i in "${!BIND_IGNORE[@]}"; do
-    entry="${BIND_IGNORE[$i]}"
-    [[ -n "$entry" ]] || continue
-    scope=""; pat="$entry"
-    if [[ "$entry" != /* && "$entry" == *:* ]]; then
-      scope="${entry%%:*}"; pat="${entry#*:}"
-    fi
-    [[ -n "$scope" && "$scope" != "$stack" ]] && continue
-    if _bind_match "$src" "$pat"; then
-      BIND_IGNORE_HITS[$i]=1
-      return 0
-    fi
+classify_stack_binds() {
+  local stack="$1" src dst ro kind entry
+  local -A _cap_idx=() _excl_idx=()
+  CAPTURE_BINDS=()
+  EXCLUDED_BINDS=()
+  BIND_COUNT=0
+  BIND_BYTES=0
+  EXCLUDED_BINDS_COUNT=0
+  NETWORK_BINDS_COUNT=0
+
+  while IFS=$'\t' read -r src dst ro; do
+    [[ -n "$src" ]] || continue
+
+    bind_capture_verdict "$stack" "$src"
+
+    case "$BIND_VERDICT" in
+      network-forced|capture)
+        if [[ -n "${_cap_idx[$src]+x}" ]]; then
+          CAPTURE_BINDS[${_cap_idx[$src]}]+=$'\x1e'"${dst}"$'\x1f'"${ro}"
+        else
+          [[ "$BIND_VERDICT" == "network-forced" ]] \
+            && log INFO "bind force-captured via BIND_INCLUDE_NETFS: $src (fstype=$BIND_FSTYPE) [$stack]"
+          kind="$(_bind_kind "$src")"
+          _cap_idx[$src]=${#CAPTURE_BINDS[@]}
+          CAPTURE_BINDS+=( "${src}"$'\t'"${BIND_FSTYPE}"$'\t'"${kind}"$'\t'"${dst}"$'\x1f'"${ro}" )
+        fi
+        ;;
+      network-excluded)
+        if [[ -z "${_excl_idx[$src]+x}" ]]; then
+          _excl_idx[$src]=1
+          log INFO "bind auto-excluded (network-fs, fstype=$BIND_FSTYPE): $src [$stack]"
+          EXCLUDED_BINDS+=( "${src}"$'\t'"${dst}"$'\t'"${BIND_FSTYPE}"$'\t'"network-fs" )
+          NETWORK_BINDS_COUNT=$((NETWORK_BINDS_COUNT + 1))
+        fi
+        ;;
+      bind-ignore)
+        if [[ -z "${_excl_idx[$src]+x}" ]]; then
+          _excl_idx[$src]=1
+          log INFO "bind excluded (BIND_IGNORE): $src [$stack]"
+          EXCLUDED_BINDS+=( "${src}"$'\t'"${dst}"$'\t'"${BIND_FSTYPE}"$'\t'"bind-ignore" )
+          EXCLUDED_BINDS_COUNT=$((EXCLUDED_BINDS_COUNT + 1))
+        fi
+        ;;
+    esac
+  done < <(stack_bind_mounts "$stack")
+
+  BIND_COUNT=${#CAPTURE_BINDS[@]}
+
+  for entry in "${CAPTURE_BINDS[@]}"; do
+    src="${entry%%$'\t'*}"
+    local _sz
+    _sz="$(du -sb "$src" 2>/dev/null | awk '{print $1}')" || true
+    BIND_BYTES=$(( BIND_BYTES + ${_sz:-0} ))
   done
-  return 1
 }
 
 # -----------------------------------------------------------------------------
-# Analyze a stack's bind mounts. Sets UNCOVERED_BINDS and IGNORED_BINDS.
+# Resolve the archive-path mapping for a stack's labelled compose config
+# files, detecting basename collisions. Sets COMPOSE_FILE_ENTRIES (entries:
+# <archive_path>\t<source_path>). A labelled file that is missing/unreadable
+# is a hard failure (returns 1) -- it must never be silently dropped.
 # -----------------------------------------------------------------------------
-analyze_stack_binds() {
-  local stack="$1" src dst
-  UNCOVERED_BINDS=0
-  IGNORED_BINDS=0
-  while IFS=$'\t' read -r src dst; do
-    [[ -n "$src" ]] || continue
-    if bind_ignored "$stack" "$src"; then
-      IGNORED_BINDS=$((IGNORED_BINDS + 1))
-      log INFO "bind acknowledged (BIND_IGNORE): $src [$stack]"
+build_compose_file_entries() {
+  local stack="$1"
+  local _cf_files=() _cf_seen _cf_idx _f _bn _aname rc=0
+  COMPOSE_FILE_ENTRIES=()
+  mapfile -t _cf_files < <(stack_compose_files "$stack")
+  declare -A _cf_seen=()
+  _cf_idx=0
+  for _f in "${_cf_files[@]}"; do
+    [[ -n "$_f" ]] || continue
+    if [[ ! -f "$_f" || ! -r "$_f" ]]; then
+      log ERROR "compose config file missing/unreadable: $_f [$stack]"
+      rc=1
       continue
     fi
-    if [[ $HAVE_COVERAGE -eq 0 ]]; then
-      log INFO "bind coverage unknown (no backup.conf): $src [$stack]"
-      continue
-    fi
-    if path_is_covered "$src"; then
-      log INFO "bind covered by host-path backup: $src [$stack]"
+    _bn="$(basename "$_f")"
+    if [[ -n "${_cf_seen[$_bn]+x}" ]]; then
+      _aname="${_cf_idx}-${_bn}"
     else
-      UNCOVERED_BINDS=$((UNCOVERED_BINDS + 1))
-      log WARNING "UNCOVERED bind mount: $src -> $dst [$stack]"
+      _aname="$_bn"
+      _cf_seen[$_bn]=1
     fi
-  done < <(stack_bind_mounts "$stack")
+    COMPOSE_FILE_ENTRIES+=( "compose/${_aname}"$'\t'"${_f}" )
+    _cf_idx=$((_cf_idx + 1))
+  done
+  return $rc
+}
+
+# -----------------------------------------------------------------------------
+# Validate that everything backup_stack is about to archive actually exists
+# and is readable *before* the stack is stopped, so a doomed backup never
+# incurs downtime. Reads: VOL_LINES, CAPTURE_BINDS (already populated by the
+# caller via stack_volumes/classify_stack_binds). Populates
+# COMPOSE_FILE_ENTRIES as a side effect. Returns 1 if anything is invalid.
+# -----------------------------------------------------------------------------
+validate_stack_inputs() {
+  local stack="$1" rc=0
+  local line name mp entry src kind
+
+  for line in "${VOL_LINES[@]}"; do
+    name="${line%%$'\t'*}"; mp="${line#*$'\t'}"
+    if [[ ! -d "$mp" || ! -r "$mp" ]]; then
+      log ERROR "volume '$name' mountpoint not accessible: $mp [$stack]"
+      rc=1
+    fi
+  done
+
+  build_compose_file_entries "$stack" || rc=1
+
+  for entry in "${CAPTURE_BINDS[@]}"; do
+    IFS=$'\t' read -r src _ kind _ <<< "$entry"
+    case "$kind" in
+      directory) [[ -d "$src" && -r "$src" ]] || { log ERROR "bind source not accessible: $src [$stack]"; rc=1; } ;;
+      file)      [[ -f "$src" && -r "$src" ]] || { log ERROR "bind source not accessible: $src [$stack]"; rc=1; } ;;
+      *)         log ERROR "bind source of unresolved kind: $src [$stack]"; rc=1 ;;
+    esac
+  done
+
+  return $rc
 }
 
 # -----------------------------------------------------------------------------
@@ -193,15 +287,17 @@ _compose_action() {
 }
 
 # -----------------------------------------------------------------------------
-# Build manifest.json for the current stack (VOL_LINES already populated).
+# Build manifest.json (schema 2) for the current stack.
+# Reads: VOL_LINES, COMPOSE_FILE_ENTRIES, CAPTURE_BINDS, EXCLUDED_BINDS.
 # -----------------------------------------------------------------------------
 write_manifest() {
   local stack="$1" wd="$2" cf="$3"
-  local epoch now line name mp
+  local epoch now line name mp entry first
   epoch="$(date +%s)"
   now="$(date -u '+%FT%TZ')"
 
-  local vjson="" first=1
+  # volumes[]
+  local vjson="" ; first=1
   for line in "${VOL_LINES[@]}"; do
     name="${line%%$'\t'*}"; mp="${line#*$'\t'}"
     [[ $first -eq 1 ]] || vjson+=","
@@ -210,8 +306,9 @@ write_manifest() {
       "$(json_escape "$name")" "$(json_escape "$mp")" "$(json_escape "$name")")"
   done
 
-  local cfjson="" f
-  first=1
+  # compose.config_files[]
+  local cfjson="" f ; first=1
+  local _cfs=()
   IFS=',' read -ra _cfs <<< "$cf"
   for f in "${_cfs[@]}"; do
     [[ -n "$f" ]] || continue
@@ -220,23 +317,76 @@ write_manifest() {
     cfjson+="$(printf '"%s"' "$(json_escape "$f")")"
   done
 
+  # compose.captured_files[]
+  local capjson="" apath fpath ; first=1
+  for entry in "${COMPOSE_FILE_ENTRIES[@]}"; do
+    apath="${entry%%$'\t'*}"; fpath="${entry#*$'\t'}"
+    [[ $first -eq 1 ]] || capjson+=","
+    first=0
+    capjson+="$(printf '{"path":"%s","source":"%s"}' \
+      "$(json_escape "$(basename "$apath")")" "$(json_escape "$fpath")")"
+  done
+
+  # binds[]. Each unique captured source becomes one record with a mounts[]
+  # list preserving every destination/RO relationship it had (see
+  # classify_stack_binds -- entries are already deduplicated by source).
+  local bindsjson="" bi=0 src fstype kind mounts_field rec dst ro ro_bool ; first=1
+  local mjson mfirst _mrecs
+  for entry in "${CAPTURE_BINDS[@]}"; do
+    IFS=$'\t' read -r src fstype kind mounts_field <<< "$entry"
+    [[ $first -eq 1 ]] || bindsjson+=","
+    first=0
+
+    mjson="" ; mfirst=1
+    IFS=$'\x1e' read -ra _mrecs <<< "$mounts_field"
+    for rec in "${_mrecs[@]}"; do
+      dst="${rec%%$'\x1f'*}"; ro="${rec#*$'\x1f'}"
+      [[ "$ro" == "true" ]] && ro_bool="true" || ro_bool="false"
+      [[ $mfirst -eq 1 ]] || mjson+=","
+      mfirst=0
+      mjson+="$(printf '{"destination":"%s","ro":%s}' "$(json_escape "$dst")" "$ro_bool")"
+    done
+
+    bindsjson+="$(printf '{"source":"%s","fstype":"%s","kind":"%s","archive_path":"binds/%d","mounts":[%s]}' \
+      "$(json_escape "$src")" "$(json_escape "$fstype")" "$(json_escape "$kind")" "$bi" "$mjson")"
+    bi=$((bi + 1))
+  done
+
+  # excluded_binds[]
+  local excljson="" reason ; first=1
+  for entry in "${EXCLUDED_BINDS[@]}"; do
+    IFS=$'\t' read -r src dst fstype reason <<< "$entry"
+    [[ $first -eq 1 ]] || excljson+=","
+    first=0
+    excljson+="$(printf '{"source":"%s","destination":"%s","fstype":"%s","reason":"%s"}' \
+      "$(json_escape "$src")" "$(json_escape "$dst")" "$(json_escape "$fstype")" "$(json_escape "$reason")")"
+  done
+
   cat <<EOF
 {
-  "schema": 1,
+  "schema": 2,
   "node": "$(json_escape "$NODE_NAME")",
   "stack": "$(json_escape "$stack")",
   "timestamp": "$now",
   "epoch": $epoch,
-  "compose": { "working_dir": "$(json_escape "$wd")", "config_files": [${cfjson}] },
-  "volumes": [${vjson}]
+  "compose": {
+    "working_dir": "$(json_escape "$wd")",
+    "config_files": [${cfjson}],
+    "captured_files": [${capjson}]
+  },
+  "volumes": [${vjson}],
+  "binds": [${bindsjson}],
+  "excluded_binds": [${excljson}]
 }
 EOF
 }
 
 # -----------------------------------------------------------------------------
-# Create the per-stack tarball: manifest.json + volumes/<vol>/... . Uses an
-# uncompressed intermediate .tar (so multiple volumes can be appended with
-# per-volume path prefixes) then gzips it. Sets BACKUP_FILE and TAR_RC.
+# Create the per-stack tarball: manifest.json + volumes/<vol>/... +
+# compose/<file> + binds/<id>/... . Uses an uncompressed intermediate .tar
+# (so entries can be appended with path prefixes) then gzips it.
+# Sets BACKUP_FILE and TAR_RC. Reads COMPOSE_FILE_ENTRIES, which must already
+# be populated by validate_stack_inputs (called before the stack was stopped).
 # GNU tar (--transform, --append) is required (Linux hosts).
 # -----------------------------------------------------------------------------
 build_stack_archive() {
@@ -257,6 +407,8 @@ build_stack_archive() {
   set +e
   tar --create --file "$tarfile" -C "$mdir" manifest.json
   TAR_RC=$?
+
+  # Append named volumes.
   for line in "${VOL_LINES[@]}"; do
     name="${line%%$'\t'*}"; mp="${line#*$'\t'}"
     if [[ ! -d "$mp" ]]; then
@@ -269,6 +421,46 @@ build_stack_archive() {
     local rc=$?
     [[ $rc -gt $TAR_RC ]] && TAR_RC=$rc
   done
+
+  # Append compose files.
+  local _entry _apath _fpath _fbname _rc
+  for _entry in "${COMPOSE_FILE_ENTRIES[@]}"; do
+    _apath="${_entry%%$'\t'*}"; _fpath="${_entry#*$'\t'}"
+    _fbname="$(basename "$_fpath")"
+    tar --append --file "$tarfile" --numeric-owner \
+      -C "$(dirname "$_fpath")" --transform "s#^${_fbname}#${_apath}#" "$_fbname"
+    _rc=$?
+    [[ $_rc -gt $TAR_RC ]] && TAR_RC=$_rc
+  done
+
+  # Append bind-mount data. <kind> was determined by classify_stack_binds
+  # (before the stack was stopped) and drives both the manifest and this
+  # archive layout, so the two always agree. Re-check existence/kind here too
+  # (not just at classify time): a bind that disappeared, changed kind, or
+  # became unreadable between classification and now is a hard archive
+  # failure -- its manifest entry must never be left pointing at missing data.
+  local _bi=0 _src _kind _bentry _sfname
+  for _bentry in "${CAPTURE_BINDS[@]}"; do
+    IFS=$'\t' read -r _src _ _kind _ <<< "$_bentry"
+    _rc=0
+    if [[ "$_kind" == "directory" && -d "$_src" && -r "$_src" ]]; then
+      tar --append --file "$tarfile" --numeric-owner \
+        -C "$_src" --transform "s#^\.#binds/${_bi}#" .
+      _rc=$?
+    elif [[ "$_kind" == "file" && -f "$_src" && -r "$_src" ]]; then
+      _sfname="$(basename "$_src")"
+      tar --append --file "$tarfile" --numeric-owner \
+        -C "$(dirname "$_src")" \
+        --transform "s#^${_sfname}#binds/${_bi}/${_sfname}#" "$_sfname"
+      _rc=$?
+    else
+      log ERROR "bind source missing/unreadable or no longer a $_kind: $_src [$stack] (archive failed)"
+      _rc=2
+    fi
+    [[ $_rc -gt $TAR_RC ]] && TAR_RC=$_rc
+    _bi=$((_bi + 1))
+  done
+
   set -e
 
   rm -rf "$mdir"
@@ -369,16 +561,20 @@ purge_stack_local() {
 push_stack_metrics() {
   local stack="$1" managed="$2" did_backup="$3" archive_success="$4" \
     all_targets="$5" size="$6" volcount="$7" down="$8" dur="$9" \
-    uncovered="${10}" ignored="${11}"
+    bind_count="${10}" bind_bytes="${11}" excluded_binds="${12}" network_binds="${13}"
   local now; now="$(date +%s)"
   local body
   body="$(cat <<EOF
 # TYPE docker_backup_managed gauge
 docker_backup_managed ${managed}
-# TYPE docker_backup_uncovered_bind_mounts gauge
-docker_backup_uncovered_bind_mounts ${uncovered}
-# TYPE docker_backup_ignored_bind_mounts gauge
-docker_backup_ignored_bind_mounts ${ignored}
+# TYPE docker_backup_bind_count gauge
+docker_backup_bind_count ${bind_count}
+# TYPE docker_backup_bind_bytes gauge
+docker_backup_bind_bytes ${bind_bytes}
+# TYPE docker_backup_excluded_binds gauge
+docker_backup_excluded_binds ${excluded_binds}
+# TYPE docker_backup_network_binds gauge
+docker_backup_network_binds ${network_binds}
 # TYPE docker_backup_last_run_timestamp_seconds gauge
 docker_backup_last_run_timestamp_seconds ${now}
 EOF
@@ -416,16 +612,23 @@ backup_stack() {
   local stack="$1"
   local start_epoch downtime_start down=0 dur=0 size=0 volcount=0
   local tar_ok=0 integ=0
+  local stop_ok=0 archive_ok=0 restart_ok=0
   start_epoch="$(date +%s)"
 
   mapfile -t VOL_LINES < <(stack_volumes "$stack")
   volcount=${#VOL_LINES[@]}
 
-  analyze_stack_binds "$stack"
+  classify_stack_binds "$stack"
 
   if [[ $volcount -eq 0 ]]; then
-    log WARNING "stack '$stack' has no named volumes; nothing to back up"
-    push_stack_metrics "$stack" 1 1 1 1 0 0 0 0 "$UNCOVERED_BINDS" "$IGNORED_BINDS"
+    log INFO "stack '$stack' has no named volumes; backing up compose files and bind data only"
+  fi
+
+  if ! validate_stack_inputs "$stack"; then
+    dur=$(( $(date +%s) - start_epoch ))
+    log ERROR "stack '$stack': input validation failed; aborting backup (stack was not stopped)"
+    push_stack_metrics "$stack" 1 1 0 0 0 "$volcount" 0 "$dur" \
+      "$BIND_COUNT" "$BIND_BYTES" "$EXCLUDED_BINDS_COUNT" "$NETWORK_BINDS_COUNT"
     return
   fi
 
@@ -433,37 +636,72 @@ backup_stack() {
   ctx="$(stack_compose_context "$stack")"
   wd="${ctx%%$'\t'*}"; cf="${ctx#*$'\t'}"
 
-  log INFO "backing up stack '$stack' (${volcount} volume(s)); stopping it now"
+  log INFO "backing up stack '$stack' (${volcount} volume(s), ${BIND_COUNT} bind(s)); stopping it now"
   downtime_start="$(date +%s)"
-  _compose_action stop "$stack" "$wd" "$cf" || log ERROR "failed to stop '$stack' cleanly"
-
-  build_stack_archive "$stack" "$wd" "$cf"
-
-  _compose_action start "$stack" "$wd" "$cf" || log ERROR "failed to restart '$stack'"
-  down=$(( $(date +%s) - downtime_start ))
-  log INFO "stack '$stack' restarted (downtime ${down}s)"
-
-  [[ ${TAR_RC:-1} -le 1 ]] && tar_ok=1
-
-  if [[ -s "$BACKUP_FILE" ]] && gzip -t "$BACKUP_FILE" 2>/dev/null; then
-    integ=1
-    size="$(wc -c < "$BACKUP_FILE" | tr -d '[:space:]')"
-    log INFO "archive integrity OK for '$stack' (${size} bytes)"
+  if _compose_action stop "$stack" "$wd" "$cf"; then
+    stop_ok=1
+    log INFO "stack '$stack': stop OK"
   else
-    log ERROR "archive integrity failed for '$stack'"
+    log ERROR "stack '$stack': failed to stop cleanly"
   fi
+
+  if [[ $stop_ok -eq 1 ]]; then
+    # Arm the restart guard: from here until a start attempt has run below,
+    # any unexpected exit (shell error, signal) triggers a best-effort
+    # restart via restart_guard_run() in the EXIT trap.
+    RESTART_GUARD_STACK="$stack"; RESTART_GUARD_WD="$wd"; RESTART_GUARD_CF="$cf"
+
+    build_stack_archive "$stack" "$wd" "$cf"
+    [[ ${TAR_RC:-1} -le 1 ]] && tar_ok=1
+
+    if [[ -s "$BACKUP_FILE" ]] && gzip -t "$BACKUP_FILE" 2>/dev/null; then
+      integ=1
+      size="$(wc -c < "$BACKUP_FILE" | tr -d '[:space:]')"
+      log INFO "stack '$stack': archive integrity OK (${size} bytes)"
+    else
+      log ERROR "stack '$stack': archive integrity failed"
+    fi
+    [[ $tar_ok -eq 1 && $integ -eq 1 ]] && archive_ok=1
+    log INFO "stack '$stack': archive=${archive_ok}"
+  else
+    log ERROR "stack '$stack': stop failed; skipping archive"
+  fi
+
+  # Best-effort restart regardless of stop/archive outcome, then clear the
+  # guard -- a start attempt has now run, whether or not it succeeded.
+  if _compose_action start "$stack" "$wd" "$cf"; then
+    restart_ok=1
+    log INFO "stack '$stack': restart OK"
+  else
+    log ERROR "stack '$stack': failed to restart"
+  fi
+  RESTART_GUARD_STACK=""
+  down=$(( $(date +%s) - downtime_start ))
 
   purge_stack_local "$stack"
 
-  local archive_ok=0
-  [[ $tar_ok -eq 1 && $integ -eq 1 ]] && archive_ok=1
+  # Delivery only depends on having a valid archive (stop_ok && archive_ok):
+  # a restart failure doesn't invalidate an already-built archive, and target
+  # metrics describe delivery independently of overall stack success.
+  if [[ $stop_ok -eq 1 && $archive_ok -eq 1 ]]; then
+    send_stack_to_targets "$stack"
+  else
+    log ERROR "stack '$stack': skipping target delivery (stop_ok=${stop_ok} archive_ok=${archive_ok})"
+    STACK_TARGETS_TOTAL=0
+    STACK_TARGETS_OK=0
+    STACK_ALL_TARGETS_OK=0
+  fi
 
-  send_stack_to_targets "$stack"
+  local overall_ok=0
+  [[ $stop_ok -eq 1 && $archive_ok -eq 1 && $restart_ok -eq 1 ]] && overall_ok=1
+  if [[ $overall_ok -ne 1 ]]; then
+    FAILED_STACKS=$((FAILED_STACKS + 1))
+  fi
 
   dur=$(( $(date +%s) - start_epoch ))
-  log INFO "stack '$stack' done: archive=${archive_ok} all_targets=${STACK_ALL_TARGETS_OK} (${STACK_TARGETS_OK}/${STACK_TARGETS_TOTAL}) size=${size}B downtime=${down}s"
-  push_stack_metrics "$stack" 1 1 "$archive_ok" "$STACK_ALL_TARGETS_OK" "$size" "$volcount" "$down" "$dur" \
-    "$UNCOVERED_BINDS" "$IGNORED_BINDS"
+  log INFO "stack '$stack' done: stop=${stop_ok} archive=${archive_ok} restart=${restart_ok} success=${overall_ok} all_targets=${STACK_ALL_TARGETS_OK} (${STACK_TARGETS_OK}/${STACK_TARGETS_TOTAL}) size=${size}B downtime=${down}s"
+  push_stack_metrics "$stack" 1 1 "$overall_ok" "$STACK_ALL_TARGETS_OK" "$size" "$volcount" "$down" "$dur" \
+    "$BIND_COUNT" "$BIND_BYTES" "$EXCLUDED_BINDS_COUNT" "$NETWORK_BINDS_COUNT"
 }
 
 # -----------------------------------------------------------------------------
@@ -496,10 +734,26 @@ EOF
 }
 
 # -----------------------------------------------------------------------------
-# EXIT trap: rotate logs.
+# Safety net for RESTART_GUARD_STACK: if a stack was stopped for backup and
+# the script exits (shell error, signal, ...) before a start attempt could
+# run, best-effort restart it here so a crash never leaves a stack down.
+# Cleared by backup_stack() itself once a normal start attempt has run.
+# -----------------------------------------------------------------------------
+restart_guard_run() {
+  if [[ -n "$RESTART_GUARD_STACK" ]]; then
+    log ERROR "restart guard: unexpected exit while '$RESTART_GUARD_STACK' was stopped; attempting best-effort restart"
+    _compose_action start "$RESTART_GUARD_STACK" "$RESTART_GUARD_WD" "$RESTART_GUARD_CF" \
+      || log ERROR "restart guard: failed to restart '$RESTART_GUARD_STACK'"
+    RESTART_GUARD_STACK=""
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# EXIT trap: run the restart guard safety net, then rotate logs.
 # -----------------------------------------------------------------------------
 finish() {
   local rc=$?
+  restart_guard_run
   rotate_logs "$LOG_DIR"
   exit "$rc"
 }
@@ -526,6 +780,10 @@ main() {
   load_config
   setup_logging "$LOG_DIR"
   trap finish EXIT
+  # Convert INT/TERM into a normal exit so the EXIT trap (and its restart
+  # guard) always gets a chance to run exactly once.
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   require_docker
 
   log INFO "starting docker-compose backup for node '${NODE_NAME}'"
@@ -549,34 +807,38 @@ main() {
     fi
     if [[ -n "${DRY_RUN:-}" ]]; then
       mapfile -t VOL_LINES < <(stack_volumes "$s")
-      analyze_stack_binds "$s"
+      classify_stack_binds "$s"
       log INFO "DRY_RUN: would back up '$s' (${#VOL_LINES[@]} volume(s))"
       push_stack_metrics "$s" 1 0 0 0 0 "${#VOL_LINES[@]}" 0 0 \
-        "$UNCOVERED_BINDS" "$IGNORED_BINDS"
+        "$BIND_COUNT" "$BIND_BYTES" "$EXCLUDED_BINDS_COUNT" "$NETWORK_BINDS_COUNT"
     else
       backup_stack "$s"
     fi
   done
 
-  # Analyze binds for every non-managed project; only count as "unmanaged
-  # stateful" those that own named volumes (i.e. something for stop-cold-copy).
+  # Analyze binds for every non-managed project; count as "unmanaged stateful"
+  # those that own named volumes OR at least one non-ephemeral bind mount
+  # (bind-only projects are stateful too — see stack_is_stateful in lib.sh).
   UNMANAGED_COUNT=0
   for s in "${projects[@]:-}"; do
     [[ -n "$s" ]] || continue
     is_managed "$s" && continue
-    analyze_stack_binds "$s"
-    if stack_has_named_volumes "$s"; then
+    classify_stack_binds "$s"
+    if stack_is_stateful "$s"; then
       UNMANAGED_COUNT=$((UNMANAGED_COUNT + 1))
-      log WARNING "UNMANAGED stateful stack (owns named volumes, not in STACKS): $s"
-    else
-      log INFO "compose project '$s' has no named volumes (state in bind mounts); bind coverage checked"
+      log WARNING "UNMANAGED stateful stack (owns named volumes or bind-mount state, not in STACKS): $s"
     fi
-    push_stack_metrics "$s" 0 0 0 0 0 0 0 0 "$UNCOVERED_BINDS" "$IGNORED_BINDS"
+    push_stack_metrics "$s" 0 0 0 0 0 0 0 0 \
+      "$BIND_COUNT" 0 "$EXCLUDED_BINDS_COUNT" "$NETWORK_BINDS_COUNT"
   done
 
   warn_stale_bind_ignore
   push_detector_metrics
-  log INFO "docker-compose backup finished: managed=${#STACKS[@]} unmanaged=${UNMANAGED_COUNT}"
+  log INFO "docker-compose backup finished: managed=${#STACKS[@]} unmanaged=${UNMANAGED_COUNT} failed=${FAILED_STACKS}"
+
+  if [[ $FAILED_STACKS -gt 0 ]]; then
+    return 1
+  fi
 }
 
 main "$@"

@@ -1,17 +1,15 @@
 # Plans
 
-> **Current system:** see [ARCHITECTURE.md](ARCHITECTURE.md). This file tracks
-> **pending work only**. The already-implemented host FS backup, backup targets,
-> and Docker stack backup are documented there; the plans that delivered them
-> have been moved out of this file.
+> **Current system:** see [ARCHITECTURE.md](ARCHITECTURE.md). This file retains
+> the implemented self-contained Docker backup phases as context for the pending
+> correctness-hardening work in Phase 6.
 
 # Plan: Self-contained Docker stack backups (decouple from host FS backup)
 
-> **Status: NOT STARTED.** Reworks the current Docker stack backup's bind-mount
-> handling (documented in [ARCHITECTURE.md](ARCHITECTURE.md)) and adjusts the
-> bind-related metrics/alerts it introduced. Everything else about that subsystem
-> (stop-cold-copy, discovery, `STACKS` allowlist, unmanaged detection, per-stack
-> archive, targets) is kept.
+> **Status: PHASES 1–6 IMPLEMENTED.** Phases 1–5 reworked the Docker stack
+> backup's bind-mount handling and related restore, metrics, alerts, and docs.
+> Phase 6 addressed correctness findings from the post-implementation
+> architecture review, including a contract test suite under `tests/`.
 
 ## Problem (current, flawed architecture)
 
@@ -204,8 +202,9 @@ No new fstypes needed — `cifs` is already in the network set.
       (plus existing `--force`, `--volume`).
     - Print `excluded_binds[]` as a reminder of external data to re-provision
       (e.g. remount SMB shares) before `up`.
-11. **Schema compatibility**: `restore.sh` must still read schema-1 archives
-    (volumes only). Branch on `manifest.schema`.
+11. **Schema compatibility**: `restore.sh` must support schema-1 archives
+  (volumes only) and schema-2 archives. Branch on `manifest.schema`; schema 1
+  skips compose/bind restore while retaining the existing volume restore.
 
 ## Phase 4 — Reconciler & detectors (`docker-backup-init.sh`)
 
@@ -235,6 +234,176 @@ No new fstypes needed — `cifs` is already in the network set.
     `ARCHITECTURE.md`: update the "Docker stack backup" and metrics/alerts
     sections to describe the self-contained bind capture and remove the
     "being reworked" notes once implemented.
+
+## Phase 6 — Correctness hardening after implementation review
+
+Phases 1–5 implemented the intended archive format and workflow, but the review
+found several paths that can still produce an incomplete archive, report a
+failed operation as successful, or restore the wrong filesystem shape. This
+phase is required before treating schema-2 archives as reliable DR units.
+
+### Confirmed failure policy
+
+These choices were confirmed by the maintainer on 2026-07-19:
+
+- If `docker compose stop` fails, **abort that stack backup**. Do not build,
+  deliver, or report a successful archive from potentially live data. Make a
+  best-effort restart before returning failure.
+- If archive creation succeeds but `docker compose start` fails, **deliver the
+  valid archive but mark the stack run failed** so monitoring reports that the
+  service was not recovered.
+- Bind-only Compose projects are first-class stateful stacks: **back up managed
+  bind-only stacks and alert on unmanaged bind-only stacks**.
+
+### Must fix (red)
+
+18. **Back up and detect bind-only stacks** (`docker-backup.sh`,
+    `docker-backup-init.sh`):
+    - Remove the `volcount == 0` early return in `backup_stack()`. A managed
+      project with compose files and/or captured binds must run the same
+      stop/archive/start/deliver flow with an empty `volumes[]` array.
+    - Define a stateful project as one with at least one named volume or at least
+      one non-ephemeral bind after discovery. Use the same definition for the
+      unmanaged detector and reconciler/bootstrap suggestions.
+    - Do not auto-manage projects whose only mounts are ephemeral/system binds.
+    - Ensure metrics for bind-only stacks report `volume_count=0`, the real bind
+      counters/bytes, and normal backup success/target status.
+
+19. **Represent and restore file binds correctly** (`docker-backup.sh`,
+    `restore.sh`, manifest schema 2):
+    - Add bind source kind metadata, e.g. `kind: "file" | "directory"`, to each
+      captured `binds[]` entry. Determine it before writing the manifest.
+    - Directory binds keep the current `binds/<id>/...` layout and restore into
+      a directory.
+    - File binds must restore to the exact source filename, not to a directory
+      named after that file. With `--bind-root /restore`, `/etc/app/config.yml`
+      must become `/restore/etc/app/config.yml`.
+    - Create only the parent directory for a file bind, extract to a temporary
+      location if needed, then install/move the file while preserving numeric
+      owner and mode. Refuse to replace an incompatible existing path unless
+      `--force` is set.
+    - Continue accepting existing schema-2 manifests without `kind`: infer file
+      versus directory from archive members, or fail with a clear actionable
+      message if inference is ambiguous.
+
+20. **Make missing or unreadable inputs fatal to archive success**
+    (`docker-backup.sh`, `lib.sh`):
+    - Resolve and validate all named-volume mountpoints, compose files, and
+      capture-selected bind sources before stopping the stack.
+    - A labelled compose config file that is missing/unreadable is a hard
+      failure; do not silently omit it from `COMPOSE_FILE_ENTRIES`.
+    - A capture-selected bind that disappears, changes kind, or becomes
+      unreadable before/during tar is a hard archive failure. Never retain it in
+      `manifest.binds[]` while omitting its data.
+    - Fix the bind tar loop so every branch assigns its own return code. Do not
+      reuse a stale `_rc` after the missing-source branch.
+    - On any tar/input failure, remove the incomplete archive, restart the stack,
+      skip target delivery, and push failure metrics.
+
+21. **Enforce stop/start state transitions and success semantics**
+    (`docker-backup.sh`):
+    - Track explicit per-stack state such as `stop_ok`, `archive_ok`, and
+      `restart_ok`; do not derive overall success from tar/gzip alone.
+    - If stop fails, do not call `build_stack_archive` or target delivery. Attempt
+      a best-effort start, then push `docker_backup_success=0`.
+    - Install a per-stack cleanup/restart guard immediately after a successful
+      stop so shell errors, signals, or archive failures cannot leave the stack
+      stopped. Clear the guard only after a successful start attempt has run.
+    - If restart fails after a valid archive was built, still run integrity
+      verification and target delivery, but push `docker_backup_success=0`.
+      Target metrics continue to describe delivery independently.
+    - Log stop, archive, restart, and delivery outcomes separately. The process
+      should finish non-zero if any managed stack failed, while still processing
+      later stacks where safe.
+
+22. **Restore the captured Compose invocation, not only basenames**
+    (`restore.sh`, manifest writer):
+    - Parse `compose.captured_files[]` with the structured JSON parser and map
+      every original config path to its archived/restored filename, including
+      basename-collision prefixes.
+    - Print a runnable command containing the required `-f <restored-file>`
+      arguments in the original `compose.config_files[]` order. Do not assume
+      plain `docker compose up -d` loads collision-renamed or non-default files.
+    - Fail compose restore if a manifest-declared captured file is absent from
+      the archive. Do not claim a full restore after partial extraction.
+    - Keep the documented limitation that `env_file:` files are not discovered,
+      but change broad “everything needed” claims to state that only labelled
+      Compose config files plus top-level `.env` are captured.
+
+### Recommended fixes (yellow)
+
+23. **Make restore overwrite behavior explicit and fail-safe** (`restore.sh`):
+    - Without `--force`, encountering any non-empty target volume, existing bind
+      target, missing selected volume, or extraction failure must make the
+      command exit non-zero; collect errors if continuing to inspect later items.
+    - Define `--force` as replacement, not merge: clear the target volume or bind
+      directory before extraction so files removed since the backup do not
+      survive the restore. Never clear outside the exact validated target path.
+    - Validate archive member paths before extraction and reject absolute paths
+      or `..` traversal entries.
+
+24. **Use one bind-classification implementation everywhere** (`lib.sh`,
+    `docker-backup.sh`, `docker-backup-init.sh`):
+    - Extract the precedence decision into a shared helper used by runtime and
+      reconciler reporting.
+    - The shared order must remain: ephemeral skip → network-fs exclusion unless
+      `BIND_INCLUDE_NETFS` matches → `BIND_IGNORE` → capture.
+    - `docker-backup-init.sh` must honor `BIND_INCLUDE_NETFS` and show a distinct
+      force-capture verdict. Its suggestions must use the same decision.
+
+25. **Correct bind metrics and duplicate-source handling** (`docker-backup.sh`,
+    manifest schema 2):
+    - Include force-captured network binds in `BIND_BYTES`.
+    - Archive identical source data once even when several containers or
+      destinations mount it. Preserve all destination/RO relationships in the
+      manifest, either as a `mounts[]` list on one source record or another
+      explicit normalized structure.
+    - Define `docker_backup_bind_count` as unique captured sources and document
+      that definition. Excluded/network counters should follow the same unique
+      source rule to avoid container-count-dependent metrics.
+
+26. **Add executable archive/restore contract tests**:
+    - Add a test harness suitable for Bash (Bats is acceptable) with Docker
+      commands stubbed where a daemon is unnecessary.
+    - Cover schema-2 manifest validity, empty volumes, bind-only stacks, empty
+      directories, file binds, duplicate sources, compose basename collisions,
+      missing compose/bind sources, and path names containing spaces.
+    - Cover stop failure, archive failure after stop, restart failure with valid
+      delivery, and the restart guard.
+    - Build a synthetic archive and perform a round-trip restore under a temp
+      root. Assert exact file/directory shape, contents, modes, config-file order,
+      `--bind-root`, `--project-dir`, `--no-binds`, `--no-compose`, and
+      replacement semantics with/without `--force`.
+    - Retain a schema-1 fixture because the implementation and confirmed
+      decision support schema-1 restore.
+
+### Nice to have (green)
+
+27. **Clean stale comments and plan state**:
+    - Update the `docker-backup.sh` header flow to mention compose files and bind
+      data rather than named volumes only.
+    - Update the `stack_bind_mounts` comment to say writable and read-only binds.
+    - Keep the plan status current as Phase 6 items are completed.
+
+### Phase 6 acceptance criteria
+
+1. A managed bind-only test stack produces and delivers a valid schema-2 archive;
+   an equivalent unmanaged project increments `docker_backup_unmanaged_stacks`.
+2. Directory and single-file binds round-trip to exactly their original shape,
+   both at original paths and under `--bind-root`.
+3. Missing compose files, missing binds, stop failure, and tar failure cannot
+   produce or deliver a successful archive.
+4. Restart failure still delivers a verified archive but reports stack/run
+   failure and exits non-zero.
+5. A forced restore replaces prior data; a non-forced conflicting restore exits
+   non-zero without changing the conflicting target.
+6. Collision-renamed Compose files restore with a printed `docker compose -f …`
+   command that preserves the original config-file order.
+7. Runtime and reconciler produce identical verdicts for ephemeral, ignored,
+   network-excluded, and force-included binds.
+8. `shellcheck` passes, all new contract tests pass, manifest JSON validates,
+   `promtool check rules alerts/linux-backups-rules.yaml` passes, and the
+   dashboard JSON parses.
 
 ## Migration notes (existing deployments)
 

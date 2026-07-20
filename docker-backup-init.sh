@@ -3,14 +3,14 @@
 # docker-backup-init.sh — bootstrap or reconcile docker-backup.conf against the
 # Docker Compose stacks actually running on this node.
 #
-# It is the "fix-it" companion to the runtime alerts DockerBackupUnmanagedStack
-# and DockerBackupUncoveredBindMount. Run it manually (NOT from cron).
+# It is the "fix-it" companion to the runtime alert DockerBackupUnmanagedStack.
+# Run it manually (NOT from cron).
 #
 #   * No docker-backup.conf yet -> offer to create one from the template,
 #     pre-populating STACKS with the discovered stateful stacks.
 #   * Existing docker-backup.conf -> report stacks that are running-but-unmanaged,
-#     configured-but-gone, and bind mounts that nothing backs up; offer to append
-#     the missing stacks (additive, never rewriting your file).
+#     configured-but-gone, and bind mounts with their fstype/verdict; offer to
+#     append the missing stacks (additive, never rewriting your file).
 #
 # Usage:
 #   docker-backup-init.sh [--print] [--write|--yes] [--config <dir>]
@@ -31,7 +31,6 @@ source "$REPO_DIR/lib.sh"
 CONFIG_DIR="${CONFIG_DIR:-/etc/linux-backups}"
 TEMPLATE="$REPO_DIR/conf/docker-backup.example.conf"
 MODE="interactive"   # interactive | print | write
-HAVE_COVERAGE=0
 
 usage() { grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; }
 
@@ -60,31 +59,6 @@ confirm() {
   [[ "$ans" == "y" || "$ans" == "Y" ]]
 }
 
-# Load coverage info (INCLUDE_PATHS/EXCLUDE_PATHS) from backup.conf if present.
-load_coverage() {
-  local host_conf="$CONFIG_DIR/backup.conf"
-  if [[ -r "$host_conf" ]]; then
-    # shellcheck disable=SC1090
-    source "$host_conf"
-    [[ -n "${INCLUDE_PATHS+x}" ]] && HAVE_COVERAGE=1
-  fi
-}
-
-# Is <src> already acknowledged by an existing BIND_IGNORE entry?
-already_ignored() {
-  local stack="$1" src="$2" entry pat scope
-  for entry in "${BIND_IGNORE[@]:-}"; do
-    [[ -n "$entry" ]] || continue
-    scope=""; pat="$entry"
-    if [[ "$entry" != /* && "$entry" == *:* ]]; then
-      scope="${entry%%:*}"; pat="${entry#*:}"
-    fi
-    [[ -n "$scope" && "$scope" != "$stack" ]] && continue
-    _bind_match "$src" "$pat" && return 0
-  done
-  return 1
-}
-
 # Print a stack's named volumes with their on-disk sizes.
 report_stack_volumes() {
   local stack="$1" name mp count=0
@@ -97,36 +71,85 @@ report_stack_volumes() {
   return 0
 }
 
-# Print each of a stack's writable bind mounts with its coverage status and
-# on-disk size, then a paste-ready list of the paths still needing coverage.
-# (stack_bind_mounts already drops read-only and ephemeral binds.)
+# Return 0 if <src> looks like a transient / scratch / download directory
+# that an admin would typically want to exclude from the backup archive.
+_is_likely_transient() {
+  local src="$1"
+  case "$src" in
+    */[Dd]ownload*|*/[Cc]ache*|*/.cache*|*/[Tt]mp/*|*/[Tt]emp/*) return 0 ;;
+    */scratch*|*/transcode*|*/[Ii]ncomplete*|*blackhole*|*/watch*) return 0 ;;
+  esac
+  return 1
+}
+
+# Print each of a stack's bind mounts (writable and read-only) with its fstype,
+# verdict (capture / network-forced / network-excluded / bind-ignore), and
+# on-disk size. Uses the same precedence decision as runtime archiving
+# (bind_capture_verdict, in lib.sh) so verdicts here can never drift from what
+# docker-backup.sh actually does.
 report_stack_binds() {
-  local stack="$1" src dst status any=0
-  UNCOVERED_PRINTED=0
-  local uncovered=() p
-  while IFS=$'\t' read -r src dst; do
+  local stack="$1" src dst ro any=0
+  while IFS=$'\t' read -r src dst ro; do
     [[ -n "$src" ]] || continue
     any=1
-    if already_ignored "$stack" "$src"; then
-      status="ignored"
-    elif [[ $HAVE_COVERAGE -eq 1 ]] && path_is_covered "$src"; then
-      status="covered"
-    elif [[ $HAVE_COVERAGE -eq 1 ]]; then
-      status="UNCOVERED"; uncovered+=( "$src" ); UNCOVERED_PRINTED=$((UNCOVERED_PRINTED + 1))
-    else
-      status="coverage-unknown"; uncovered+=( "$src" ); UNCOVERED_PRINTED=$((UNCOVERED_PRINTED + 1))
-    fi
-    printf '      bind [%s] %s (%s) -> %s\n' "$status" "$src" "$(dir_size_human "$src")" "$dst"
+    bind_capture_verdict "$stack" "$src"
+    local ro_label=""
+    [[ "$ro" == "true" ]] && ro_label=",ro"
+    printf '      bind [%s%s] %s  fstype=%s  size=%s  -> %s\n' \
+      "$BIND_VERDICT" "$ro_label" "$src" "$BIND_FSTYPE" "$(dir_size_human "$src")" "$dst"
   done < <(stack_bind_mounts "$stack")
+  [[ $any -eq 0 ]] && printf '      (no bind mounts)\n'
+  return 0
+}
 
-  [[ $any -eq 0 ]] && printf '      (no writable bind mounts)\n'
+# Scan all projects for capture-verdict binds (including force-included
+# network-fs binds) that look transient or are shared across multiple stacks,
+# and print BIND_IGNORE suggestions for each match. Uses the same precedence
+# decision as runtime archiving (bind_capture_verdict, in lib.sh).
+suggest_bind_ignore() {
+  local -A _src_stacks=()   # source_path -> space-separated stack names
+  local _stack _src _dst _ro
 
-  if [[ ${#uncovered[@]} -gt 0 ]]; then
-    printf '      => add these to INCLUDE_PATHS in backup.conf (or BIND_IGNORE if transient):\n'
-    for p in "${uncovered[@]}"; do
-      printf '           %q\n' "$p"
-    done
-  fi
+  for _stack in "$@"; do
+    [[ -n "$_stack" ]] || continue
+    while IFS=$'\t' read -r _src _dst _ro; do
+      [[ -n "$_src" ]] || continue
+      bind_capture_verdict "$_stack" "$_src"
+      case "$BIND_VERDICT" in
+        network-excluded|bind-ignore) continue ;;
+      esac
+      local _existing="${_src_stacks[$_src]:-}"
+      if [[ -z "$_existing" ]]; then
+        _src_stacks[$_src]="$_stack"
+      else
+        _src_stacks[$_src]="$_existing $_stack"
+      fi
+    done < <(stack_bind_mounts "$_stack")
+  done
+
+  local _suggestions=() _entry _s_src _s_reason _wc
+  for _src in "${!_src_stacks[@]}"; do
+    local _stacks_using="${_src_stacks[$_src]}"
+    local _reason=""
+    _wc=$(printf '%s' "$_stacks_using" | wc -w)
+    if [[ $_wc -gt 1 ]]; then
+      _reason="shared by: ${_stacks_using}"
+    fi
+    if _is_likely_transient "$_src"; then
+      _reason="${_reason:+${_reason}; }likely-transient path"
+    fi
+    [[ -n "$_reason" ]] && _suggestions+=( "${_src}|${_reason}" )
+  done
+
+  [[ ${#_suggestions[@]} -eq 0 ]] && return 0
+
+  echo
+  echo "  BIND_IGNORE candidates (add to docker-backup.conf to exclude from archive):"
+  local _entry _s_src _s_reason
+  for _entry in "${_suggestions[@]}"; do
+    _s_src="${_entry%%|*}"; _s_reason="${_entry#*|}"
+    printf '    BIND_IGNORE+=( %q )  # %s\n' "$_s_src" "$_s_reason"
+  done
 }
 
 # Append STACKS entries under a dated, clearly-marked block.
@@ -169,7 +192,6 @@ apply_append() {
 main() {
   parse_args "$@"
   require_docker
-  load_coverage
 
   local conf="$CONFIG_DIR/docker-backup.conf"
   local projects=() name
@@ -186,15 +208,15 @@ main() {
       log INFO "no compose projects found; nothing to bootstrap"
     fi
     declare -a BIND_IGNORE=()
+    declare -a BIND_INCLUDE_NETFS=()
     local chosen=()
     for name in "${projects[@]:-}"; do
       [[ -n "$name" ]] || continue
       echo "  project: $name"
       report_stack_volumes "$name"
       report_stack_binds "$name"
-      if ! stack_has_named_volumes "$name"; then
-        # No named volumes to stop-cold-copy; cover any UNCOVERED binds above
-        # via INCLUDE_PATHS in backup.conf instead of adding to STACKS.
+      if ! stack_is_stateful "$name"; then
+        # No named volumes and no non-ephemeral bind mounts; nothing to back up.
         continue
       fi
       case "$MODE" in
@@ -204,6 +226,7 @@ main() {
           if confirm "Back up stack '$name'?"; then chosen+=( "$name" ); fi ;;
       esac
     done
+    suggest_bind_ignore "${projects[@]:-}"
     if [[ "$MODE" == "print" ]]; then
       echo
       log INFO "print mode: no file written. Re-run with --write or interactively to create $conf"
@@ -218,17 +241,16 @@ main() {
   source "$conf"
   [[ -n "${STACKS+x}" ]] || STACKS=()
   [[ -n "${BIND_IGNORE+x}" ]] || BIND_IGNORE=()
+  [[ -n "${BIND_INCLUDE_NETFS+x}" ]] || BIND_INCLUDE_NETFS=()
 
-  local unmanaged=() bindonly=() gone=() s found
+  local unmanaged=() gone=() s found
   for name in "${projects[@]:-}"; do
     [[ -n "$name" ]] || continue
     found=0
     for s in "${STACKS[@]:-}"; do [[ "$s" == "$name" ]] && found=1 && break; done
     [[ $found -eq 1 ]] && continue
-    if stack_has_named_volumes "$name"; then
+    if stack_is_stateful "$name"; then
       unmanaged+=( "$name" )
-    else
-      bindonly+=( "$name" )
     fi
   done
   for s in "${STACKS[@]:-}"; do
@@ -240,8 +262,7 @@ main() {
 
   echo "Reconciliation report:"
   echo "  managed stacks: ${STACKS[*]:-<none>}"
-  echo "  running but UNMANAGED (own volumes): ${unmanaged[*]:-<none>}"
-  echo "  bind-only projects (cover via INCLUDE_PATHS): ${bindonly[*]:-<none>}"
+  echo "  running but UNMANAGED (own volumes or bind-mount state): ${unmanaged[*]:-<none>}"
   echo "  configured but GONE (down/renamed?): ${gone[*]:-<none>}"
   echo "  project details (volume & bind sizes):"
   for name in "${projects[@]:-}"; do
@@ -251,6 +272,7 @@ main() {
     report_stack_binds "$name"
   done
   echo
+  suggest_bind_ignore "${projects[@]:-}"
 
   if [[ ${#gone[@]} -gt 0 ]]; then
     log WARNING "configured stacks with no live state: ${gone[*]} (not removed automatically)"

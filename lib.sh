@@ -440,6 +440,16 @@ stack_has_named_volumes() {
   [[ -n "$first" ]]
 }
 
+# Return 0 if <stack> owns any state worth backing up: at least one named
+# volume, or at least one non-ephemeral bind mount (stack_has_bind_mounts is
+# defined below, next to stack_bind_mounts). Bind-only projects are stateful
+# too — they just have no volumes to stop-cold-copy. A project whose only
+# mounts are ephemeral/system binds (docker.sock, /etc/localtime, ...) is NOT
+# stateful, since stack_bind_mounts already filters those out.
+stack_is_stateful() {
+  stack_has_named_volumes "$1" || stack_has_bind_mounts "$1"
+}
+
 # Print "<volume-name>\t<mountpoint>" for each named volume mounted by any
 # container of <stack>. Derived from the containers' .Mounts (not from volume
 # labels), so it also finds volumes declared `external:` / created out-of-band.
@@ -479,21 +489,57 @@ stack_compose_context() {
   printf '%s\t%s\n' "$wd" "$cf"
 }
 
-# Print "<source>\t<destination>" for each read-write bind mount used by any
-# container of <stack>. Ephemeral/system binds are filtered out here.
+# Print one file path per line for every compose file belonging to <stack>
+# that should be captured into the archive's compose/ directory:
+#   - each path from the com.docker.compose.project.config_files label, and
+#   - <working_dir>/.env if it exists on disk.
+# Limitation: env_file: directives and files outside working_dir are not
+# parsed; only the top-level .env is added automatically.
+stack_compose_files() {
+  local stack="$1" ctx wd cf f env_file
+  ctx="$(stack_compose_context "$stack")"
+  wd="${ctx%%$'\t'*}"; cf="${ctx#*$'\t'}"
+
+  # Emit each config file from the compose label that exists on disk.
+  if [[ -n "$cf" ]]; then
+    local _cfs=()
+    IFS=',' read -ra _cfs <<< "$cf"
+    for f in "${_cfs[@]}"; do
+      [[ -n "$f" && -f "$f" ]] && printf '%s\n' "$f"
+    done
+  fi
+
+  # Add .env from the working directory when present.
+  if [[ -n "$wd" ]]; then
+    env_file="$wd/.env"
+    [[ -f "$env_file" ]] && printf '%s\n' "$env_file"
+  fi
+}
+
+# Print "<source>\t<destination>\t<read-only>" for each writable and read-only
+# bind mount used by any container of <stack>. Ephemeral/system binds are
+# filtered out here.
 stack_bind_mounts() {
-  local stack="$1" cid type src dst rw
+  local stack="$1" cid type src dst rw ro
   while IFS= read -r cid; do
     [[ -n "$cid" ]] || continue
     while IFS=$'\t' read -r type src dst rw; do
       [[ "$type" == "bind" ]] || continue
-      [[ "$rw" == "true" ]] || continue
       _is_ephemeral_bind "$src" && continue
-      printf '%s\t%s\n' "$src" "$dst"
+      [[ "$rw" == "true" ]] && ro="false" || ro="true"
+      printf '%s\t%s\t%s\n' "$src" "$dst" "$ro"
     done < <(docker inspect "$cid" \
       --format '{{ range .Mounts }}{{ .Type }}{{ "\t" }}{{ .Source }}{{ "\t" }}{{ .Destination }}{{ "\t" }}{{ .RW }}{{ "\n" }}{{ end }}' \
       2>/dev/null)
   done < <(stack_containers "$stack") | sort -u
+}
+
+# Return 0 if <stack> has at least one non-ephemeral bind mount (read-write or
+# read-only). Used by stack_is_stateful to treat bind-only projects as stateful.
+stack_has_bind_mounts() {
+  local first
+  first="$(stack_bind_mounts "$1" | head -n 1)"
+  [[ -n "$first" ]]
 }
 
 # Return 0 if <source> is a well-known ephemeral/system bind that should never
@@ -508,29 +554,119 @@ _is_ephemeral_bind() {
   return 1
 }
 
-# Return 0 if <path> is under _path_ancestor <ancestor>.
-_path_under() {
-  local path="$1" anc="$2"
-  [[ "$path" == "$anc" || "$path" == "$anc"/* ]]
+# Return the filesystem type for <path> using findmnt (preferred) with a
+# fallback to stat. Prints the fstype string; returns 1 if undetermined.
+_bind_fstype() {
+  local path="$1" fstype
+  fstype="$(findmnt -no FSTYPE --target "$path" 2>/dev/null)"
+  if [[ -z "$fstype" ]]; then
+    fstype="$(stat -f -c '%T' "$path" 2>/dev/null)"
+  fi
+  if [[ -n "$fstype" ]]; then
+    printf '%s' "$fstype"
+    return 0
+  fi
+  return 1
 }
 
-# Return 0 if <path> is covered by the caller's INCLUDE_PATHS (and not excluded
-# by EXCLUDE_PATHS). Both arrays are read from the caller's environment. When
-# INCLUDE_PATHS is unset the path is treated as not covered.
-path_is_covered() {
-  local target inc exc
-  target="$(realpath -m "$1" 2>/dev/null || printf '%s' "$1")"
-  for exc in "${EXCLUDE_PATHS[@]:-}"; do
-    [[ -n "$exc" ]] || continue
-    _path_under "$target" "$(realpath -m "$exc" 2>/dev/null || printf '%s' "$exc")" \
-      && return 1
-  done
-  for inc in "${INCLUDE_PATHS[@]:-}"; do
-    [[ -n "$inc" ]] || continue
-    _path_under "$target" "$(realpath -m "$inc" 2>/dev/null || printf '%s' "$inc")" \
-      && return 0
+# Return 0 if <fstype> is a network/remote/tmpfs filesystem that should be
+# auto-excluded from bind-mount capture (unless overridden by BIND_INCLUDE_NETFS).
+_is_network_fs() {
+  local fstype="$1"
+  case "$fstype" in
+    cifs|smb2|smb3|nfs|nfs4|fuse.sshfs|fuse.rclone|glusterfs|ceph|tmpfs) return 0 ;;
+  esac
+  return 1
+}
+
+# BIND_IGNORE matching. An entry is either "<pattern>" or "<stack>:<pattern>".
+# <pattern> is an exact path, a directory subtree (trailing "/"), or a glob.
+# If the caller has declared an associative array BIND_IGNORE_HITS, the
+# matching index is recorded there (used by docker-backup.sh to warn about
+# stale BIND_IGNORE entries that matched nothing in a run). Callers that don't
+# need hit-tracking (e.g. docker-backup-init.sh) simply never declare it.
+bind_ignored() {
+  local stack="$1" src="$2" i entry pat scope
+  for i in "${!BIND_IGNORE[@]}"; do
+    entry="${BIND_IGNORE[$i]}"
+    [[ -n "$entry" ]] || continue
+    scope=""; pat="$entry"
+    if [[ "$entry" != /* && "$entry" == *:* ]]; then
+      scope="${entry%%:*}"; pat="${entry#*:}"
+    fi
+    [[ -n "$scope" && "$scope" != "$stack" ]] && continue
+    if _bind_match "$src" "$pat"; then
+      # Note: `${BIND_IGNORE_HITS+x}` would test element [0]/"0" of the array,
+      # not whether the array itself is declared -- use `declare -p` so hit
+      # tracking works regardless of which index actually matches first.
+      # Also note: BIND_IGNORE_HITS is associative, so the subscript must be
+      # `$i` (literal key) -- `[i]` (bare, no `$`) would set the literal key
+      # "i" for every entry instead of the actual index.
+      # shellcheck disable=SC2004
+      declare -p BIND_IGNORE_HITS &>/dev/null && BIND_IGNORE_HITS[$i]=1
+      return 0
+    fi
   done
   return 1
+}
+
+# Return 0 if <src> matches an entry in the BIND_INCLUDE_NETFS allowlist.
+# Force-captures a network-fs bind despite the auto-exclusion in rule 2.
+bind_include_netfs() {
+  local src="$1" pat
+  for pat in "${BIND_INCLUDE_NETFS[@]:-}"; do
+    [[ -n "$pat" ]] || continue
+    _bind_match "$src" "$pat" && return 0
+  done
+  return 1
+}
+
+# Classify a single bind-mount source using the canonical 5-rule precedence
+# (ephemeral binds are already filtered out upstream by stack_bind_mounts):
+#   network-fs exclusion (unless BIND_INCLUDE_NETFS matches) -> BIND_IGNORE
+#   -> capture.
+# Sets BIND_VERDICT to one of:
+#   network-excluded  -- network/remote fs, not force-included
+#   network-forced    -- network/remote fs, force-included via BIND_INCLUDE_NETFS
+#   bind-ignore       -- matched a BIND_IGNORE entry
+#   capture           -- none of the above; archived normally
+# and BIND_FSTYPE to the detected filesystem type ("unknown" if undetermined).
+# Sets globals rather than printing so bind_ignored's BIND_IGNORE_HITS side
+# effect is never lost to a command-substitution subshell. This is the single
+# implementation of the precedence decision shared by docker-backup.sh
+# (runtime archiving) and docker-backup-init.sh (reconciler reporting and
+# BIND_IGNORE suggestions), so their verdicts can never drift apart.
+BIND_VERDICT=""
+BIND_FSTYPE=""
+# shellcheck disable=SC2034
+bind_capture_verdict() {
+  local stack="$1" src="$2"
+  BIND_FSTYPE="$(_bind_fstype "$src")" || BIND_FSTYPE="unknown"
+  if _is_network_fs "$BIND_FSTYPE"; then
+    if bind_include_netfs "$src"; then
+      BIND_VERDICT="network-forced"
+    else
+      BIND_VERDICT="network-excluded"
+    fi
+  elif bind_ignored "$stack" "$src"; then
+    BIND_VERDICT="bind-ignore"
+  else
+    BIND_VERDICT="capture"
+  fi
+}
+
+# Print "file", "directory", or "unknown" for the current on-disk type of
+# <path>. Used to record bind-mount kind metadata before a stack is stopped,
+# so the manifest and the archive layout it describes agree with each other.
+_bind_kind() {
+  local path="$1"
+  if [[ -d "$path" ]]; then
+    printf 'directory'
+  elif [[ -f "$path" ]]; then
+    printf 'file'
+  else
+    printf 'unknown'
+  fi
 }
 
 # Minimal JSON string escaper (backslash and double-quote only — sufficient for

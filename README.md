@@ -276,32 +276,55 @@ cron job, and remove the old script/`env`/`purge.sh`.
 
 ## Docker Compose backups
 
-`docker-backup.sh` backs up the **named volumes** of your Docker Compose stacks,
-one archive per stack, so a restore is per-stack and less error-prone. To keep
-databases consistent without any dump tooling it uses **stop-cold-copy**: it runs
-`docker compose stop`, tars the stack's volumes, then `docker compose start`.
-There is therefore a brief per-stack downtime while the archive is built.
+`docker-backup.sh` creates **self-contained, disaster-recoverable** archives for
+each Docker Compose stack — named volumes, bind-mount data, and the labelled
+Compose config files plus top-level `.env`, in a single file. It runs
+**independently** of the host FS backup; running one or both is a valid
+configuration.
+
+Each archive (layout v2) contains:
+
+| Path in archive | Contents |
+| --- | --- |
+| `manifest.json` | Schema 2 metadata (stack, node, timestamp, captured files, bind list) |
+| `compose/` | `docker-compose.yml`, override, `.env` — all compose project files |
+| `volumes/<name>/` | Named volume data (stop-cold-copy) |
+| `binds/<id>/` | Local bind-mount data (stop-cold-copy) |
+
+Archive flow:
 
 ```
-discover compose projects  ->  for each allowlisted stack:
-  docker compose stop  ->  tar volumes + manifest  ->  docker compose start
-      ->  verify (gzip -t)  ->  purge local old  ->  azcopy copy  ->  push metrics
+discover → for each allowlisted stack:
+  classify bind mounts (fstype + rules)
+  docker compose stop
+    → tar manifest + compose/ + volumes/ + binds/
+  docker compose start
+  → verify → purge local old → deliver to targets → push metrics
 ```
 
-Each stack archive is uploaded to `<container>/<node>/docker/<stack>/` and
-contains a `manifest.json` plus `volumes/<volume-name>/...` for every named
-volume.
+Bind-mount classification uses the filesystem type (via `findmnt`):
 
-> The archive is built by reading each volume's mountpoint **directly on the
-> host**, so this requires a native Linux Docker engine (where a volume lives at
-> `/var/lib/docker/volumes/<name>/_data`). On Docker Desktop (macOS/Windows)
-> volumes live inside a VM and are not host-accessible; the run fails loudly
-> (`mountpoint not accessible`) rather than producing an incomplete archive.
+- **Network/remote** (CIFS/SMB, NFS, fuse.sshfs, fuse.rclone, …) — **auto-excluded**.
+  No need to list them in `BIND_IGNORE`; they appear in `docker_backup_network_binds`.
+- **`BIND_IGNORE`** matches — excluded from the archive (transient local data:
+  download queues, caches, scratch dirs).
+- **Everything else** (local ext4/btrfs/xfs/overlayfs) — **captured** into `binds/<id>/`.
+
+> The archive reads each volume and bind mountpoint **directly on the host**, so
+> this requires a native Linux Docker engine (volumes live at
+> `/var/lib/docker/volumes/<name>/_data`). Docker Desktop (macOS/Windows) stores
+> volumes inside a VM; the run fails loudly rather than silently producing an
+> incomplete archive.
+>
+> Only the Compose files named in `com.docker.compose.project.config_files`
+> plus a top-level `working_dir/.env` (if present) are captured — `env_file:`
+> directives and config files outside `working_dir` are not discovered and must
+> be re-provisioned separately.
 
 ### Configuration
 
-Create `$CONFIG_DIR/docker-backup.conf` from the template (it reuses
-`DEST_URL` / `SAS_TOKEN` / `PROM_GTW` from `secrets.env`):
+Create `$CONFIG_DIR/docker-backup.conf` from the template (**independent** of
+`backup.conf` — no host backup required):
 
 ```bash
 sudo cp /opt/linux-backups/conf/docker-backup.example.conf /etc/linux-backups/docker-backup.conf
@@ -314,8 +337,8 @@ the `<container>/<node>/docker/` prefix (see below).
 
 ### Discovering and reconciling stacks
 
-`docker-backup-init.sh` inspects the running compose landscape and helps you fill
-in `docker-backup.conf`. Run it manually (never from cron):
+`docker-backup-init.sh` inspects the running compose landscape and helps you manage
+`docker-backup.conf`. Run it manually (never from cron):
 
 ```bash
 sudo /opt/linux-backups/docker-backup-init.sh            # interactive
@@ -324,21 +347,15 @@ sudo /opt/linux-backups/docker-backup-init.sh --write    # append missing stacks
 ```
 
 With no config it offers to create one from the discovered stacks. With an
-existing config it reports stacks that are **running but unmanaged**,
-**configured but gone**, and **bind mounts nothing backs up**, and can append the
-missing stacks (additively, after backing your file up to `docker-backup.conf.bak-<ts>`).
-Each reported stack lists its named volumes and each writable bind mount with its
-**on-disk size** (`du`) and a **coverage status** (`[covered]` / `[UNCOVERED]` /
-`[ignored]`), plus a paste-ready list of any uncovered paths to add to
-`INCLUDE_PATHS`. (A volume shows `?` when its mountpoint is not host-accessible,
-e.g. on Docker Desktop.)
+existing config it reports stacks that are **running but unmanaged** or
+**configured but gone**, and can append the missing stacks (additively, after
+backing your file up to `docker-backup.conf.bak-<ts>`).
 
-Discovery covers **all** compose projects (via the `com.docker.compose.project`
-container label), and a stack's named volumes are detected from its **container
-mounts** — so `external:` / unlabeled volumes are found too, not just
-compose-labelled ones. A project that keeps its state only in **bind mounts** is
-listed with a note to cover it via `INCLUDE_PATHS` in `backup.conf` (there are no
-named volumes to stop-cold-copy).
+Each reported stack shows its named volumes and each bind mount with its on-disk
+size, fstype, and verdict: `[capture]`, `[netfs-excluded]`, or `[bind-ignore]`.
+
+The tool also flags likely-transient or multi-stack bind sources and prints
+paste-ready `BIND_IGNORE+=( ... )` suggestions.
 
 ### Scheduling
 
@@ -358,27 +375,14 @@ Test it without stopping anything or uploading:
 sudo DRY_RUN=1 /opt/linux-backups/docker-backup.sh
 ```
 
-`DRY_RUN=1` only discovers stacks, evaluates bind-mount coverage, and reports —
-it does **not** stop stacks, build archives, or upload.
+`DRY_RUN=1` discovers stacks, classifies bind mounts, and pushes metrics — it does
+**not** stop stacks, build archives, or upload.
 
-### Unmanaged stacks and bind mounts
+### Unmanaged stacks
 
-`docker-backup.sh` never backs up a stack unless it is on the `STACKS`
-allowlist. Instead it **detects and alerts**:
-
-- **Unmanaged stacks** — a running stack that owns named volumes but isn't on the
-  allowlist raises `docker_backup_unmanaged_stacks` (alert `DockerBackupUnmanagedStack`).
-- **Uncovered bind mounts** — compose stacks often keep state in host bind mounts.
-  For every compose project on the host (including stacks with **no** named
-  volumes) the script inspects its bind mounts, filters ephemeral ones
-  (`docker.sock`, `/etc/localtime`, …), and checks the rest against the host-path
-  backup (`INCLUDE_PATHS` in `backup.conf`). A bind that is neither covered nor
-  acknowledged raises `docker_backup_uncovered_bind_mounts` (alert
-  `DockerBackupUncoveredBindMount`).
-
-Once you have checked a bind mount and confirmed it is throwaway data, add it to
-`BIND_IGNORE` in `docker-backup.conf` to silence the warning. Entries that stop
-matching anything are reported as `stale BIND_IGNORE entry` so the list stays honest.
+`docker-backup.sh` never backs up a stack unless it is on the `STACKS` allowlist.
+Stacks that own named volumes but are not listed raise `docker_backup_unmanaged_stacks`
+(alert `DockerBackupUnmanagedStack`). Run `docker-backup-init.sh` to add them.
 
 ### Metrics
 
@@ -388,14 +392,16 @@ Pushed under `job="docker_backup"`, grouped per stack
 | Metric | Meaning |
 | --- | --- |
 | `docker_backup_success` | 1 = stack backup OK, 0 = failure. |
-| `docker_backup_size_bytes` | Stack archive size. |
+| `docker_backup_size_bytes` | Total archive size (volumes + compose + binds). |
 | `docker_backup_volume_count` | Named volumes captured. |
+| `docker_backup_bind_count` | Local bind-mount sources captured. |
+| `docker_backup_bind_bytes` | Raw size of captured bind data (bytes, before compression). |
+| `docker_backup_excluded_binds` | Bind sources excluded via `BIND_IGNORE`. |
+| `docker_backup_network_binds` | Network-fs bind sources auto-excluded. |
 | `docker_backup_stop_seconds` | Per-stack downtime during stop-cold-copy. |
 | `docker_backup_duration_seconds` | Total time for the stack. |
 | `docker_backup_last_run_timestamp_seconds` | When the stack was last processed. |
 | `docker_backup_last_success_timestamp_seconds` | Last successful stack backup (persists across failures). |
-| `docker_backup_uncovered_bind_mounts` | Bind mounts nothing backs up. |
-| `docker_backup_ignored_bind_mounts` | Bind mounts acknowledged via `BIND_IGNORE`. |
 | `docker_backup_managed` | 1 = on the allowlist, 0 = detected-only. |
 
 A node-level group (`instance="<node>"`, no `stack`) carries
@@ -403,19 +409,29 @@ A node-level group (`instance="<node>"`, no `stack`) carries
 
 ### Restoring a stack
 
-`restore.sh` recreates a stack's volumes from an archive (run as root on the host):
+`restore.sh` rehydrates a stack end-to-end from an archive (run as root on the host):
 
 ```bash
-# Restore all volumes from the archive into (re)created named volumes
-sudo /opt/linux-backups/restore.sh /var/backups/linux-backups/docker/srv-1-immich-2026-07-12-03-00.tar.gz
+# Full DR restore: named volumes + compose files + bind data
+sudo /opt/linux-backups/restore.sh /var/backups/linux-backups/docker/srv-1-immich-2026-07-19-03-00.tar.gz
 
-# Overwrite existing non-empty volumes, or restore only some volumes
+# Restore to a different project directory and remapped bind-root
+sudo /opt/linux-backups/restore.sh <archive> --project-dir /opt/stacks/immich --bind-root /restore
+
+# Restore volumes only (skip compose files and bind data)
+sudo /opt/linux-backups/restore.sh <archive> --no-compose --no-binds
+
+# Overwrite existing non-empty volumes, or restore only specific volumes
 sudo /opt/linux-backups/restore.sh <archive> --force
 sudo /opt/linux-backups/restore.sh <archive> --volume immich_pgdata
 ```
 
-It reads `manifest.json`, recreates each named volume, extracts its contents,
-and prints the `docker compose up -d` step to bring the stack back.
+`restore.sh` reads `manifest.json`, recreates each named volume, extracts its
+contents, restores compose files, and rehydrates bind-mount data. After restore it
+prints any bind mounts that were **not** captured (network mounts, BIND_IGNORE
+entries) as a reminder to re-provision them before `docker compose up -d`.
+
+Schema-1 archives (volumes only, from older backups) are fully supported.
 
 ### Remote retention for stacks
 
@@ -476,7 +492,7 @@ failure — that is now `backup_target_success == 0` / `backup_all_targets_succe
 - **Alerts:** redeploy [`alerts/linux-backups-rules.yaml`](alerts/linux-backups-rules.yaml).
   New rules: `LinuxBackupTargetFailed`, `LinuxBackupTargetStale`,
   `DockerBackupFailed`, `DockerBackupStale`, `DockerBackupUnmanagedStack`,
-  `DockerBackupUncoveredBindMount`, `DockerBackupTargetFailed`. `LinuxBackupFailed`
+  `DockerBackupTargetFailed`. `LinuxBackupFailed`
   now reflects an archive failure only; `LinuxBackupStale` reflects
   fully-replicated staleness.
 

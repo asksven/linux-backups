@@ -295,7 +295,7 @@
     },
     {
       "id": 10,
-      "title": "Unmanaged stacks & uncovered bind mounts",
+      "title": "Unmanaged stacks & bind summary",
       "type": "table",
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 36 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
@@ -310,7 +310,7 @@
         },
         {
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "docker_backup_uncovered_bind_mounts{job=\"docker_backup\"}",
+          "expr": "docker_backup_bind_count{job=\"docker_backup\"}",
           "legendFormat": "{{instance}} / {{stack}}",
           "instant": true,
           "format": "table",
@@ -318,11 +318,19 @@
         },
         {
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "docker_backup_ignored_bind_mounts{job=\"docker_backup\"}",
+          "expr": "docker_backup_excluded_binds{job=\"docker_backup\"}",
           "legendFormat": "{{instance}} / {{stack}}",
           "instant": true,
           "format": "table",
           "refId": "C"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "docker_backup_network_binds{job=\"docker_backup\"}",
+          "legendFormat": "{{instance}} / {{stack}}",
+          "instant": true,
+          "format": "table",
+          "refId": "D"
         }
       ],
       "transformations": [
@@ -335,8 +343,9 @@
               "instance": "Node",
               "stack": "Stack",
               "Value #A": "unmanaged stacks",
-              "Value #B": "uncovered binds",
-              "Value #C": "ignored binds"
+              "Value #B": "binds captured",
+              "Value #C": "binds excluded (BIND_IGNORE)",
+              "Value #D": "binds excluded (network-fs)"
             }
           }
         }

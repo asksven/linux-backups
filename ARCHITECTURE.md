@@ -4,11 +4,6 @@ Reference documentation for the **implemented** `linux-backups` system. This
 describes how things work today. Pending/forward-looking work is tracked
 separately in [PLAN.md](PLAN.md).
 
-> **Note:** the Docker stack backup's bind-mount handling described under
-> [Docker stack backup](#docker-stack-backup-docker-backupsh) is currently being
-> reworked — see the "Self-contained Docker stack backups" plan in
-> [PLAN.md](PLAN.md). The rest of this document reflects stable behavior.
-
 ## Overview
 
 The repo provides host-level and Docker-Compose-level backups for a fleet of
@@ -63,7 +58,8 @@ config and secrets are themselves restorable.
   `BACKUP_DIR`, `RETENTION_DAYS` (local), `REMOTE_RETENTION_DAYS`, `BLOCK_SIZE_MB`,
   optional `LOG_DIR`, `INCLUDE_PATHS=(...)`, `EXCLUDE_PATHS=(...)`.
 - `$CONFIG_DIR/docker-backup.conf` — Docker backup: `STACKS=(...)` allowlist,
-  `DOCKER_BACKUP_DIR`, retention/block-size, `STOP_TIMEOUT`, `BIND_IGNORE=(...)`.
+  `DOCKER_BACKUP_DIR`, retention/block-size, `STOP_TIMEOUT`, `BIND_IGNORE=(...)`,
+  `BIND_INCLUDE_NETFS=(...)`.
 - `$CONFIG_DIR/secrets.env` — `PROM_GTW` and (legacy) `DEST_URL`/`SAS_TOKEN`.
 - `$CONFIG_DIR/targets/*.conf` — one file per backup destination (see
   [Backup targets](#backup-targets)); sensitive, `chmod 600`, never committed.
@@ -121,7 +117,11 @@ one locally built archive is fanned out to N destinations. Used by both
 
 ## Docker stack backup (`docker-backup.sh`)
 
-Backs up the persistent state of Docker Compose stacks, one archive per stack.
+Creates **self-contained, disaster-recoverable** archives for each Compose stack —
+one archive contains named volumes, bind-mount data, and the labelled Compose
+config files plus top-level `.env` needed to rebuild the stack on a wiped host
+(`env_file:` directives and config files outside `working_dir` are not
+discovered).
 
 - **DB consistency via stop-cold-copy**: `docker compose stop` → tar the state →
   `docker compose start`. Stopping flushes state to disk, so a raw tar is
@@ -130,35 +130,56 @@ Backs up the persistent state of Docker Compose stacks, one archive per stack.
 - **Discovery**: live Docker, via `com.docker.compose.project` labels on volumes
   and containers — independent of how a stack was started. A stack "has state" if
   it owns named volumes.
-- **Per stack** (sequential, to minimize downtime): resolve volumes + mountpoints,
-  derive the compose project dir/config files from container labels, stop, tar
-  each volume's `_data` into a per-volume subdir + write `manifest.json`, start,
-  verify (`gzip -t` + non-empty), purge old local tarballs, then deliver via targets.
+- **Archive layout v2** (schema 2): `manifest.json` + `compose/` (project files)
+  + `volumes/<name>/` (named volume data) + `binds/<id>/` (local bind data).
+- **Per stack** (sequential, to minimize downtime): classify bind mounts →
+  stop → tar volumes + compose files + local bind data + write `manifest.json` →
+  start → verify (`gzip -t` + non-empty) → purge old local tarballs → deliver via
+  targets → push metrics.
 - **Unmanaged detection**: stateful stacks not on `STACKS` raise
   `docker_backup_unmanaged_stacks` + an alert — never auto-added.
-- **Bind mounts** *(being reworked — see [PLAN.md](PLAN.md))*: bind sources are
-  enumerated, an ephemeral/system filter drops infra noise (`docker.sock`,
-  `/etc/localtime`, `/proc`, …), `BIND_IGNORE` acknowledges transient binds, and
-  each remaining source is coverage-checked against the host backup's
-  `INCLUDE_PATHS`. Uncovered, unacknowledged binds only *warn*
-  (`docker_backup_uncovered_bind_mounts`); their data is not captured in the stack
-  archive today.
+- **Bind-mount classification** (5-rule precedence per bind source):
+  1. Ephemeral/system paths (`docker.sock`, `/etc/localtime`, `/proc`, …) — silently skipped.
+  2. Network/remote fstype (`cifs`, `smb2/3`, `nfs/nfs4`, `fuse.sshfs`, `fuse.rclone`,
+     `glusterfs`, `ceph`, `tmpfs`) — auto-excluded; counted as `docker_backup_network_binds`.
+  3. `BIND_INCLUDE_NETFS` allowlist — override: force-capture even if network-fs.
+  4. `BIND_IGNORE` match — excluded from archive; counted as `docker_backup_excluded_binds`.
+  5. All remaining local sources — captured into `binds/<id>/`; counted as
+     `docker_backup_bind_count`, sized as `docker_backup_bind_bytes`.
+  - Classification, and all four counters above, are keyed by **unique source
+    path per stack**, not by container-mount occurrence: identical host data
+    bind-mounted by several containers or at several destinations is archived
+    once (as one `binds/<id>/`) and counted once. Its full set of
+    destination/RO relationships is preserved in the manifest as a `mounts[]`
+    list on that one `binds[]` record, so no relationship is lost even though
+    the data itself is stored/counted once. `docker_backup_bind_bytes`
+    includes force-captured network binds (rule 3), since those are archived
+    too.
+- **Subsystem independence**: `docker-backup.sh` reads only `docker-backup.conf`.
+  No dependency on `backup.conf` or the host FS backup.
 
 ## Restore (`restore.sh`)
 
-`restore.sh <archive>` reads `manifest.json`, `docker volume create`s each volume,
-and extracts each per-volume subdir into its volume via a throwaway `alpine`
-helper container, then prints the `docker compose up` next steps.
+`restore.sh <archive>` reads `manifest.json` (schema 1 or 2), recreates named
+volumes via a throwaway `alpine` container, restores compose project files, and
+rehydrates local bind-mount data. After restore it prints any bind sources that
+were not captured (network mounts, BIND_IGNORE entries) as a re-provisioning
+reminder, then prints the `docker compose up -d` next steps.
+
+Flags: `--project-dir <path>` (compose file destination), `--bind-root <path>`
+(remap bind destinations), `--no-compose`, `--no-binds`, `--force`, `--volume <v>`.
 
 ## Config bootstrap & reconcile (`docker-backup-init.sh`)
 
 An interactive admin helper (run manually, not from cron) that inspects the live
 Docker Compose landscape and helps create or reconcile `docker-backup.conf`. It is
-the "fix-it" companion to the `DockerBackupUnmanagedStack` /
-`DockerBackupUncoveredBindMount` alerts. It reuses the `lib.sh` discovery helpers,
-lists each stack's volumes and binds with on-disk sizes, and appends additive
-`STACKS+=( ... )` lines under a dated comment block (backing up the conf first,
-never rewriting existing entries). Bind acknowledgments are printed, not applied.
+the "fix-it" companion to the `DockerBackupUnmanagedStack` alert. It reuses the
+`lib.sh` discovery helpers, lists each stack's volumes and bind mounts with
+on-disk sizes and classification verdicts (`capture`, `netfs-excluded`,
+`bind-ignore`), and appends additive `STACKS+=( ... )` lines under a dated
+comment block (backing up the conf first, never rewriting existing entries).
+Paste-ready `BIND_IGNORE+=( ... )` suggestions are printed for likely-transient
+or multi-stack bind sources.
 
 ## Metrics & Pushgateway semantics
 
@@ -184,9 +205,10 @@ the rest**. This is load-bearing:
 - Docker per-stack group (`.../instance/<node>/stack/<stack>`): `docker_backup_success`,
   `docker_backup_duration_seconds`, `docker_backup_size_bytes`,
   `docker_backup_volume_count`, `docker_backup_stop_seconds`,
-  `docker_backup_last_run_timestamp_seconds`, `docker_backup_last_success_timestamp_seconds`,
-  and the bind-mount metrics (being reworked). Docker archives also push per-target
-  metrics under `.../stack/<stack>/target/<t>`.
+  `docker_backup_bind_count`, `docker_backup_bind_bytes`,
+  `docker_backup_excluded_binds`, `docker_backup_network_binds`,
+  `docker_backup_last_run_timestamp_seconds`, `docker_backup_last_success_timestamp_seconds`.
+  Docker archives also push per-target metrics under `.../stack/<stack>/target/<t>`.
 - Detector group (`.../instance/<node>`): `docker_backup_unmanaged_stacks`.
 
 ## Alerts (`alerts/linux-backups-rules.yaml`)
@@ -197,8 +219,8 @@ Plain Prometheus rules, labelled `severity` (critical/warning) + `type`:
 - `LinuxBackupTargetFailed` — a target failed to deliver.
 - `LinuxBackupStale` / `LinuxBackupTargetStale` — no success within the window
   (also catches "cron didn't run at all").
-- `DockerBackupFailed`, `DockerBackupStale`, `DockerBackupUnmanagedStack`, and the
-  bind-mount alert (being reworked).
+- `DockerBackupFailed`, `DockerBackupStale`, `DockerBackupUnmanagedStack`,
+  `DockerBackupTargetFailed`, `DockerBackupTargetStale`.
 
 ## Dashboard
 

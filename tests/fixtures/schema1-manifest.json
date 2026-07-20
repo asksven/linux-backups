@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "node": "oldnode",
+  "stack": "legacyapp",
+  "timestamp": "2023-01-01T00:00:00Z",
+  "epoch": 1672531200,
+  "volumes": [
+    {"name": "legacyapp_data", "mountpoint": "/var/lib/docker/volumes/legacyapp_data/_data"}
+  ]
+}
