@@ -58,6 +58,40 @@ assert len(d["binds"][0]["mounts"]) == 1
   rm -rf "$work"
 }
 
+test_manifest_consistency_field() {
+  local work; work="$(mktemp -d)"
+  _setup_common "$work"
+  stack_bind_mounts() { :; }
+  classify_stack_binds "mystack"
+
+  local manifest
+  manifest="$(write_manifest "mystack" "/wd" "docker-compose.yml")"
+  echo "$manifest" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["consistency"] == {"stopped": True}
+'
+  assert_status "$?" "0" "write_manifest defaults consistency.stopped=true when stopped is omitted"
+
+  manifest="$(write_manifest "mystack" "/wd" "docker-compose.yml" "1")"
+  echo "$manifest" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["consistency"] == {"stopped": True}
+'
+  assert_status "$?" "0" "write_manifest emits consistency.stopped=true for stopped=1"
+
+  manifest="$(write_manifest "mystack" "/wd" "docker-compose.yml" "0")"
+  echo "$manifest" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["consistency"] == {"stopped": False}
+'
+  assert_status "$?" "0" "write_manifest emits consistency.stopped=false for stopped=0 (hot backup)"
+
+  rm -rf "$work"
+}
+
 test_empty_volumes_and_bind_only_stack() {
   local work; work="$(mktemp -d)"
   mkdir -p "$work/data/bind1"

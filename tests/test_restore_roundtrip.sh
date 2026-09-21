@@ -20,10 +20,12 @@ STUB_BIN_DIR="$TESTS_DIR/fixtures/bin"
 
 # Build a schema-2 archive under $1/backups/*.tar.gz containing: one named
 # volume (a file with a specific mode), two compose files (one basename
-# collision), one directory bind, one file bind. Prints the archive path on
-# stdout; returns non-zero if fixture construction itself failed.
+# collision), one directory bind, one file bind. $2 is the "stopped" flag
+# forwarded to build_stack_archive (default "1", i.e. consistency.stopped=
+# true); pass "0" to build a hot (NO_STOP_STACKS) archive. Prints the archive
+# path on stdout; returns non-zero if fixture construction itself failed.
 _build_archive() {
-  local work="$1"
+  local work="$1" stopped="${2:-1}"
   mkdir -p "$work/src/volume/vol1_data" \
     "$work/src/compose/proj/override" \
     "$work/src/binds/dirbind/subdir"
@@ -68,7 +70,8 @@ EOF
   validate_stack_inputs "mystack" >/dev/null || return 1
 
   build_stack_archive "mystack" "$work/src/compose/proj" \
-    "$work/src/compose/proj/docker-compose.yml,$work/src/compose/proj/override/docker-compose.yml"
+    "$work/src/compose/proj/docker-compose.yml,$work/src/compose/proj/override/docker-compose.yml" \
+    "$stopped"
   [[ "$TAR_RC" -le 1 ]] || return 1
 
   printf '%s' "$BACKUP_FILE"
@@ -188,6 +191,60 @@ test_restore_no_force_rejects_conflicting_targets_without_modifying_them() {
   assert_file_content "${bindroot}${work}/src/binds/dirbind/subdir/f.txt" "dir bind content" "forced restore replaces the directory bind content"
   assert_not_exists "${bindroot}${work}/src/binds/dirbind/stray.txt" "forced restore clears prior stray directory-bind content"
   assert_file_content "${bindroot}${work}/src/binds/filebind.conf" "file bind content" "forced restore replaces the file bind content"
+
+  rm -rf "$work"
+}
+
+test_restore_warns_on_hot_archive() {
+  local work; work="$(mktemp -d)"
+  local archive; archive="$(_build_archive "$work" "0")"
+  if [[ -z "$archive" ]]; then fail "fixture archive build failed"; rm -rf "$work"; return; fi
+
+  local state="$work/docker_state" out="$work/out.log" err="$work/err.log" rc=0
+  _run_restore "$state" "$out" "$err" "$archive" --force || rc=$?
+  assert_status "$rc" "0" "restore of a hot archive still exits 0: $(cat "$err")"
+  assert_contains "$(cat "$out")" "HOT" "restore warns that the archive was taken hot"
+  assert_contains "$(cat "$out")" "consistency.stopped=false" "warning names the manifest field"
+
+  rm -rf "$work"
+}
+
+test_restore_no_warning_when_consistency_field_absent() {
+  local work; work="$(mktemp -d)"
+  local archive; archive="$(_build_archive "$work")"
+  if [[ -z "$archive" ]]; then fail "fixture archive build failed"; rm -rf "$work"; return; fi
+
+  # Simulate an archive written before the "consistency" field existed
+  # (older schema-2, per the plan's backwards-compatibility requirement): swap
+  # out just the manifest.json member in place (delete + re-append), so every
+  # other member keeps the exact shape build_stack_archive gave it -- unlike a
+  # naive full extract/repack, which would introduce bare directory entries
+  # tar never produces on its own and that restore.sh's compose-restore path
+  # cannot handle.
+  local staging="$work/patched"
+  mkdir -p "$staging"
+  "$TAR" -C "$staging" -xzf "$archive" manifest.json
+  python3 -c "
+import json
+with open('$staging/manifest.json') as f:
+    d = json.load(f)
+d.pop('consistency', None)
+with open('$staging/manifest.json', 'w') as f:
+    json.dump(d, f)
+"
+  assert_not_contains "$(cat "$staging/manifest.json")" "consistency" "fixture setup: field actually removed"
+
+  local patched_tar="$work/patched.tar" patched="$work/patched.tar.gz"
+  gunzip -c "$archive" > "$patched_tar"
+  "$TAR" --delete -f "$patched_tar" manifest.json
+  "$TAR" --append -f "$patched_tar" -C "$staging" manifest.json
+  gzip -f "$patched_tar"
+
+  local state="$work/docker_state" out="$work/out.log" err="$work/err.log" rc=0
+  _run_restore "$state" "$out" "$err" "$patched" --force || rc=$?
+  assert_status "$rc" "0" "restore without a consistency field still exits 0: $(cat "$err")"
+  assert_not_contains "$(cat "$out")" "HOT" "no hot-archive warning when consistency is absent"
+  assert_file_content "$state/volumes/vol1/data.txt" "vol content" "volume still restores when consistency is absent"
 
   rm -rf "$work"
 }

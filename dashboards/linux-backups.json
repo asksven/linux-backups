@@ -401,6 +401,46 @@
         }
       ],
       "options": { "showHeader": true }
+    },
+    {
+      "id": 12,
+      "title": "Stack stop policy (hot vs stop-cold-copy)",
+      "description": "Reflects the consistency of the last VALID archive per stack. A run that fails before producing an archive (failed stop or input validation) does not push this metric, so it keeps showing the last successful value instead of a misleading one -- cross-check docker_backup_success for the current run's outcome.",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 52 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "docker_backup_stack_stopped{job=\"docker_backup\"}",
+          "legendFormat": "{{instance}} / {{stack}}",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no successful archive yet",
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "HOT (NO_STOP_STACKS)", "color": "yellow" } } },
+            { "type": "value", "options": { "1": { "text": "COLD (stop-cold-copy)", "color": "blue" } } }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "yellow", "value": null },
+              { "color": "blue", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      }
     }
   ]
 }

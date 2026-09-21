@@ -126,6 +126,16 @@ discovered).
 - **DB consistency via stop-cold-copy**: `docker compose stop` → tar the state →
   `docker compose start`. Stopping flushes state to disk, so a raw tar is
   consistent without `pg_dump`/`mysqldump`. Trade-off: brief per-stack downtime.
+- **Per-stack stop policy**: a stack listed in `NO_STOP_STACKS` (exact name or
+  glob) is backed up **hot** instead — `_compose_action stop`/`start` are never
+  called and the restart guard is never armed, `docker_backup_stop_seconds` is
+  0, `docker_backup_stack_stopped` is 0, and `manifest.json` records
+  `consistency.stopped: false` (an additive field; schema stays 2). `restore.sh`
+  warns when this field is `false` and stays silent when it is absent (older
+  archives). Only appropriate for stacks that cannot write inconsistent state
+  while `tar` runs. `docker_backup_stack_stopped` is only pushed alongside a
+  valid archive (see Metrics below), so a failed stop/validation never reports
+  a misleading hot/cold value.
 - **Selection**: an explicit `STACKS` allowlist of Compose project names.
 - **Discovery**: live Docker, via `com.docker.compose.project` labels on volumes
   and containers — independent of how a stack was started. A stack "has state" if
@@ -157,6 +167,17 @@ discovered).
     too.
 - **Subsystem independence**: `docker-backup.sh` reads only `docker-backup.conf`.
   No dependency on `backup.conf` or the host FS backup.
+- **Local-only mode**: `LOCAL_ONLY=true` in `docker-backup.conf` skips target
+  delivery entirely (archives stay in `DOCKER_BACKUP_DIR`, pruned by
+  `RETENTION_DAYS`) and reports `STACK_ALL_TARGETS_OK=1` so dashboards don't
+  show a phantom delivery failure. Neither `conf/targets/` nor `secrets.env` is
+  required in this mode; `--check-targets` short-circuits to a no-op success.
+  `load_config()` only requires `secrets.env` to exist when `LOCAL_ONLY` is not
+  `true`; without it and without `LOCAL_ONLY`, zero configured targets is still
+  an `ERROR` and `STACK_ALL_TARGETS_OK=0`, since that usually indicates a
+  misconfiguration. A local-only host with no `secrets.env` also has no
+  `PROM_GTW`, so metrics pushes are skipped (see Metrics below) — ship a
+  `secrets.env` with just `PROM_GTW` set to keep the dashboard populated.
 
 ## Restore (`restore.sh`)
 
@@ -171,15 +192,29 @@ Flags: `--project-dir <path>` (compose file destination), `--bind-root <path>`
 
 ## Config bootstrap & reconcile (`docker-backup-init.sh`)
 
-An interactive admin helper (run manually, not from cron) that inspects the live
-Docker Compose landscape and helps create or reconcile `docker-backup.conf`. It is
-the "fix-it" companion to the `DockerBackupUnmanagedStack` alert. It reuses the
-`lib.sh` discovery helpers, lists each stack's volumes and bind mounts with
-on-disk sizes and classification verdicts (`capture`, `netfs-excluded`,
-`bind-ignore`), and appends additive `STACKS+=( ... )` lines under a dated
-comment block (backing up the conf first, never rewriting existing entries).
-Paste-ready `BIND_IGNORE+=( ... )` suggestions are printed for likely-transient
-or multi-stack bind sources.
+An admin helper that inspects the live Docker Compose landscape and helps create
+or reconcile `docker-backup.conf`. It is the "fix-it" companion to the
+`DockerBackupUnmanagedStack` alert. Writing changes (bootstrap, `--write`/`--yes`,
+interactive) stays manual-only (not from cron); `--check` is read-only and
+purpose-built for cron/CI: it reports the same running-but-unmanaged /
+configured-but-gone drift and exits 1 if any exists, 0 if the config is in sync,
+without writing anything.
+
+It reuses the `lib.sh` discovery helpers (`stack_is_stateful`, `bind_capture_verdict`,
+`stack_stop_policy`), lists each stack's volumes and bind mounts with on-disk
+sizes and classification verdicts (`capture`, `netfs-excluded`, `bind-ignore`)
+plus its effective stop policy, and — under `--write`/`--yes` — appends missing
+`STACKS+=( ... )` entries unconditionally (backing up the conf first, never
+rewriting existing entries, all additions under one dated comment block).
+`BIND_IGNORE+=( ... )` and `NO_STOP_STACKS+=( ... )` suggestions are heuristics
+(shared/likely-transient bind sources; "no known database signature found") and
+are only applied when `--apply-bind-ignore`/`--apply-stop-policy` is also given
+(or approved individually in interactive mode) — never just because `--write`/
+`--yes` was passed. `NO_STOP_STACKS` candidates are proposed conservatively:
+only stacks with no container running a known database image and no
+`*.sqlite*`/`*.db`/WAL file under their bind/volume roots; a root that can't be
+scanned at all (missing, unreadable, or a `find` error) counts as "can't rule
+out a database", not as a clean result.
 
 ## Metrics & Pushgateway semantics
 
@@ -205,7 +240,7 @@ the rest**. This is load-bearing:
 - Docker per-stack group (`.../instance/<node>/stack/<stack>`): `docker_backup_success`,
   `docker_backup_duration_seconds`, `docker_backup_size_bytes`,
   `docker_backup_volume_count`, `docker_backup_stop_seconds`,
-  `docker_backup_bind_count`, `docker_backup_bind_bytes`,
+  `docker_backup_stack_stopped`, `docker_backup_bind_count`, `docker_backup_bind_bytes`,
   `docker_backup_excluded_binds`, `docker_backup_network_binds`,
   `docker_backup_last_run_timestamp_seconds`, `docker_backup_last_success_timestamp_seconds`.
   Docker archives also push per-target metrics under `.../stack/<stack>/target/<t>`.

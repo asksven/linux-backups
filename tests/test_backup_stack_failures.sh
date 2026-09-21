@@ -73,6 +73,119 @@ test_stop_failure_skips_archive_and_delivery() {
   rm -rf "$work"
 }
 
+test_stop_failure_does_not_emit_misleading_stack_stopped_metric() {
+  local work; work="$(mktemp -d)"
+  _setup "$work"
+  STUB_STOP_RC=1
+  local captured_body=""
+  # shellcheck disable=SC2317
+  pushgateway_post() { captured_body="$2"; }
+
+  backup_stack "mystack"
+
+  assert_not_contains "$captured_body" "docker_backup_stack_stopped" "no archive exists after a failed stop; the consistency metric must not be pushed"
+
+  rm -rf "$work"
+}
+
+test_validation_failure_does_not_emit_misleading_stack_stopped_metric() {
+  local work; work="$(mktemp -d)"
+  _setup "$work"
+  # A bind source that does not exist on disk makes validate_stack_inputs fail
+  # (unresolved kind) before any stop is attempted.
+  # shellcheck disable=SC2317
+  stack_bind_mounts() { printf '%s\t%s\t%s\n' "$work/does-not-exist" "/dst/bind1" "false"; }
+  local captured_body=""
+  # shellcheck disable=SC2317
+  pushgateway_post() { captured_body="$2"; }
+
+  backup_stack "mystack"
+
+  assert_not_contains "$captured_body" "docker_backup_stack_stopped" "no archive exists after failed validation; the consistency metric must not be pushed"
+
+  rm -rf "$work"
+}
+
+test_successful_cold_backup_emits_stack_stopped_metric() {
+  local work; work="$(mktemp -d)"
+  _setup "$work"
+  stub_tar_as_gtar
+  local captured_body=""
+  # shellcheck disable=SC2317
+  pushgateway_post() { captured_body="$2"; }
+  DEST_URL="https://fake.blob.core.windows.net/container"
+  # shellcheck disable=SC2317
+  azcopy() { echo "Number of Transfers Failed: 0"; return 0; }
+
+  backup_stack "mystack"
+
+  assert_contains "$captured_body" "docker_backup_stack_stopped 1" "a successful cold archive still reports its achieved consistency"
+
+  rm -rf "$work"
+}
+
+test_stop_failure_still_attempts_restart() {
+  local work; work="$(mktemp -d)"
+  _setup "$work"
+  STUB_STOP_RC=1
+  local start_called=0
+  # shellcheck disable=SC2317
+  docker() {
+    if [[ "$1" == "compose" ]]; then
+      local action="${*: -3:1}"
+      case "$action" in
+        stop) return "$STUB_STOP_RC" ;;
+        start) start_called=1; return "$STUB_START_RC" ;;
+      esac
+    fi
+    return 0
+  }
+  # shellcheck disable=SC2317
+  send_stack_to_targets() { fail "send_stack_to_targets must not be called on stop failure"; }
+
+  backup_stack "mystack"
+
+  assert_eq "$start_called" "1" "a best-effort restart is still attempted after a failed stop"
+  assert_eq "$RESTART_GUARD_STACK" "" "restart guard is cleared again after the attempted restart"
+  assert_eq "$FAILED_STACKS" "1" "stop failure still counts the stack as failed overall"
+
+  rm -rf "$work"
+}
+
+test_restart_guard_armed_before_stop_is_attempted() {
+  local work; work="$(mktemp -d)"
+  _setup "$work"
+  stub_tar_as_gtar
+
+  # The guard must already be armed with THIS stack's identity by the time
+  # `docker compose stop` runs -- not only after stop returns success -- so
+  # an interruption during the stop call itself is still covered.
+  local guard_during_stop=""
+  # shellcheck disable=SC2317
+  docker() {
+    if [[ "$1" == "compose" ]]; then
+      local action="${*: -3:1}"
+      [[ "$action" == "stop" ]] && guard_during_stop="$RESTART_GUARD_STACK"
+      case "$action" in
+        stop) return "$STUB_STOP_RC" ;;
+        start) return "$STUB_START_RC" ;;
+      esac
+    fi
+    return 0
+  }
+
+  DEST_URL="https://fake.blob.core.windows.net/container"
+  # shellcheck disable=SC2317
+  azcopy() { echo "Number of Transfers Failed: 0"; return 0; }
+
+  backup_stack "mystack"
+
+  assert_eq "$guard_during_stop" "mystack" "restart guard is armed before docker compose stop is invoked"
+  assert_eq "$RESTART_GUARD_STACK" "" "restart guard is cleared again once the run completes"
+
+  rm -rf "$work"
+}
+
 test_tar_failure_after_successful_stop_skips_delivery() {
   local work; work="$(mktemp -d)"
   _setup "$work"

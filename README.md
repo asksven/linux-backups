@@ -299,7 +299,7 @@ discover → for each allowlisted stack:
   docker compose stop
     → tar manifest + compose/ + volumes/ + binds/
   docker compose start
-  → verify → purge local old → deliver to targets → push metrics
+  → verify → purge local old → deliver to targets (skipped if LOCAL_ONLY) → push metrics
 ```
 
 Bind-mount classification uses the filesystem type (via `findmnt`):
@@ -335,15 +335,64 @@ Only stacks listed in `STACKS` are backed up. `RETENTION_DAYS` controls the
 **local** copies; remote retention is enforced by the Azure lifecycle policy on
 the `<container>/<node>/docker/` prefix (see below).
 
+### Local-only mode (no cloud/NAS destination)
+
+Set `LOCAL_ONLY=true` in `docker-backup.conf` to keep archives on this host only.
+No target delivery is attempted and none needs to be configured — `conf/targets/`
+and `secrets.env` are not required. Local retention (`RETENTION_DAYS`) still
+applies. `docker-backup.sh --check-targets` recognizes the mode and exits 0
+without probing targets. This is the supported setup for a docker-compose-only
+MVP where disaster recovery relies on this host's disk rather than an off-site
+copy. `LOCAL_ONLY` must be exactly `true` or `false`; any other value (e.g. a
+typo like `TRUE`) makes `docker-backup.sh` refuse to run rather than silently
+falling back to remote delivery.
+
+Without `LOCAL_ONLY=true`, a missing `secrets.env` is still a fatal
+misconfiguration (it may hold target credentials the run depends on). With no
+`secrets.env` at all, `PROM_GTW` is also unset, so metrics pushes are skipped
+(logged, not an error) — if you still want the Pushgateway dashboard on a
+local-only host, ship a `secrets.env` containing just `PROM_GTW=...`.
+
+### Per-stack stop policy (hot vs stop-cold-copy)
+
+By default every managed stack is backed up **stop-cold-copy**: `docker compose
+stop` → tar → `docker compose start`. Downtime is usually a few seconds, but it
+is real downtime.
+
+List a stack in `NO_STOP_STACKS` to back it up **hot** instead — the stack is
+never stopped or started, `docker_backup_stop_seconds` is 0, and the archive's
+`manifest.json` records `consistency.stopped: false` so a later `restore.sh`
+prints a warning that the data may only be crash-consistent:
+
+```bash
+NO_STOP_STACKS=(
+  "homepage"       # static dashboard, no writable state worth pausing for
+)
+```
+
+Each entry is an exact Compose project name or a glob (e.g. `"static-*"`).
+Only do this for stacks that cannot write inconsistent state while `tar` runs —
+no embedded database, no SQLite/WAL files, no long-running writers.
+`docker-backup-init.sh` (below) proposes candidates conservatively: it checks
+every container's image against common database images (postgres, mysql,
+mariadb, mongo, redis, influxdb, elasticsearch) and scans bind/volume roots for
+`*.sqlite*`/`*.db`/WAL files, and only suggests a stack when none of that is
+found *and* every root could actually be scanned — a missing/unreadable root or
+a scan error is treated as "can't rule out a database" (keep stop-cold-copy),
+not as a clean result. This is a heuristic hint, not a safety guarantee: always
+review a suggestion before adding it.
+
 ### Discovering and reconciling stacks
 
 `docker-backup-init.sh` inspects the running compose landscape and helps you manage
-`docker-backup.conf`. Run it manually (never from cron):
+`docker-backup.conf`. Writing changes is manual-only (never from cron); `--check`
+is read-only and is safe to schedule (see below):
 
 ```bash
 sudo /opt/linux-backups/docker-backup-init.sh            # interactive
 sudo /opt/linux-backups/docker-backup-init.sh --print    # report only, no changes
-sudo /opt/linux-backups/docker-backup-init.sh --write    # append missing stacks non-interactively
+sudo /opt/linux-backups/docker-backup-init.sh --write    # apply STACKS suggestions non-interactively
+sudo /opt/linux-backups/docker-backup-init.sh --check    # drift check only; exit 0/1, no changes
 ```
 
 With no config it offers to create one from the discovered stacks. With an
@@ -352,10 +401,25 @@ existing config it reports stacks that are **running but unmanaged** or
 backing your file up to `docker-backup.conf.bak-<ts>`).
 
 Each reported stack shows its named volumes and each bind mount with its on-disk
-size, fstype, and verdict: `[capture]`, `[netfs-excluded]`, or `[bind-ignore]`.
+size, fstype, and verdict: `[capture]`, `[netfs-excluded]`, or `[bind-ignore]`,
+plus its effective stop policy (stop-cold-copy or hot via `NO_STOP_STACKS`).
 
-The tool also flags likely-transient or multi-stack bind sources and prints
-paste-ready `BIND_IGNORE+=( ... )` suggestions.
+The tool also flags likely-transient or multi-stack bind sources and stacks with
+no detected database signature, printing paste-ready `BIND_IGNORE+=( ... )` and
+`NO_STOP_STACKS+=( ... )` suggestions. These are both heuristics — a shared or
+transient-looking path isn't necessarily safe to exclude everywhere, and "no
+database signature found" isn't a safety proof — so `--write`/`--yes` never
+applies them on their own. Add `--apply-bind-ignore` and/or
+`--apply-stop-policy` to also apply them, or approve each one individually in
+interactive mode; `--print` only ever prints them:
+
+```bash
+sudo /opt/linux-backups/docker-backup-init.sh --write --apply-bind-ignore --apply-stop-policy
+```
+
+`--check` reports the same running-but-unmanaged / configured-but-gone drift as
+above, writes nothing, and exits `1` if there is drift or `0` if the config is in
+sync — suitable for cron/CI in addition to the `DockerBackupUnmanagedStack` alert.
 
 ### Scheduling
 
@@ -378,6 +442,41 @@ sudo DRY_RUN=1 /opt/linux-backups/docker-backup.sh
 `DRY_RUN=1` discovers stacks, classifies bind mounts, and pushes metrics — it does
 **not** stop stacks, build archives, or upload.
 
+### Scheduling a drift check
+
+`docker-backup-init.sh --check` is read-only (no stops, no writes) and safe to run
+unattended, unlike the rest of the tool. Cron:
+
+```cron
+# Warn (via mail/MAILTO or your cron wrapper) if the config has drifted
+15 3 * * * root /opt/linux-backups/docker-backup-init.sh --check || echo "docker-backup.conf drift detected on $(hostname -s)"
+```
+
+Or a systemd timer:
+
+```ini
+# /etc/systemd/system/docker-backup-check.service
+[Unit]
+Description=Check docker-backup.conf for drift
+
+[Service]
+Type=oneshot
+ExecStart=/opt/linux-backups/docker-backup-init.sh --check
+```
+
+```ini
+# /etc/systemd/system/docker-backup-check.timer
+[Unit]
+Description=Daily docker-backup.conf drift check
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
 ### Unmanaged stacks
 
 `docker-backup.sh` never backs up a stack unless it is on the `STACKS` allowlist.
@@ -394,10 +493,11 @@ Pushed under `job="docker_backup"`, grouped per stack
 | `docker_backup_success` | 1 = stack backup OK, 0 = failure. |
 | `docker_backup_size_bytes` | Total archive size (volumes + compose + binds). |
 | `docker_backup_volume_count` | Named volumes captured. |
-| `docker_backup_bind_count` | Local bind-mount sources captured. |
+| `docker_backup_bind_count` | **Unique** local bind-mount sources captured. A source mounted by several containers or at several destinations counts once. |
 | `docker_backup_bind_bytes` | Raw size of captured bind data (bytes, before compression). |
-| `docker_backup_excluded_binds` | Bind sources excluded via `BIND_IGNORE`. |
-| `docker_backup_network_binds` | Network-fs bind sources auto-excluded. |
+| `docker_backup_excluded_binds` | Unique bind sources excluded via `BIND_IGNORE`. |
+| `docker_backup_network_binds` | Unique network-fs bind sources auto-excluded. |
+| `docker_backup_stack_stopped` | 1 = stop-cold-copy (default), 0 = hot backup via `NO_STOP_STACKS`. Only pushed alongside a valid archive; a failed stop/validation leaves the last successful value in place rather than reporting a misleading one. |
 | `docker_backup_stop_seconds` | Per-stack downtime during stop-cold-copy. |
 | `docker_backup_duration_seconds` | Total time for the stack. |
 | `docker_backup_last_run_timestamp_seconds` | When the stack was last processed. |

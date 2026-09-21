@@ -10,9 +10,11 @@
 #   3. Discover stacks that own named volumes or non-ephemeral bind mounts
 #      (com.docker.compose.project label).
 #   4. For each stack on the STACKS allowlist:
-#        docker compose stop -> tar each volume into volumes/<vol>/, capture
-#        compose files into compose/, capture bind mounts into binds/, write
-#        manifest -> docker compose start -> verify -> purge local -> azcopy copy.
+#        docker compose stop (skipped for NO_STOP_STACKS) -> tar each volume
+#        into volumes/<vol>/, capture compose files into compose/, capture
+#        bind mounts into binds/, write manifest -> docker compose start
+#        (skipped along with stop) -> verify -> purge local -> deliver to
+#        configured targets (skipped entirely when LOCAL_ONLY=true).
 #   5. Detect stateful stacks NOT on the allowlist (alert only, never auto-add).
 #   6. Push per-stack + detector metrics to the Pushgateway.
 #
@@ -26,7 +28,8 @@
 #   NO_SELF_UPDATE=1 Skip the git self-update step
 #
 # --check-targets probes each target's credentials/reachability and exits 0 if
-# all pass (non-zero otherwise); it performs no backup.
+# all pass (non-zero otherwise); it performs no backup. With LOCAL_ONLY=true it
+# short-circuits to a no-op success (there are no targets to probe).
 # =============================================================================
 
 set -euo pipefail
@@ -47,6 +50,7 @@ UNMANAGED_COUNT=0
 FAILED_STACKS=0
 declare -a VOL_LINES=()
 declare -A BIND_IGNORE_HITS=()
+declare -A NO_STOP_STACKS_HITS=()
 declare -a CAPTURE_BINDS=()
 declare -a EXCLUDED_BINDS=()
 declare -a COMPOSE_FILE_ENTRIES=()
@@ -82,8 +86,9 @@ parse_args() {
 load_config() {
   local secrets="$CONFIG_DIR/secrets.env"
   local conf="$CONFIG_DIR/docker-backup.conf"
+  local secrets_loaded=1
 
-  load_secrets "$secrets"
+  load_secrets "$secrets" optional && secrets_loaded=0
 
   if [[ ! -r "$conf" ]]; then
     log ERROR "config file not found or unreadable: $conf"
@@ -99,6 +104,21 @@ load_config() {
   RETENTION_DAYS="${RETENTION_DAYS:-7}"
   DOCKER_BACKUP_DIR="${DOCKER_BACKUP_DIR:-/var/backups/linux-backups/docker}"
   LOG_DIR="${DOCKER_LOG_DIR:-$DOCKER_BACKUP_DIR/logs}"
+  LOCAL_ONLY="${LOCAL_ONLY:-false}"
+  case "$LOCAL_ONLY" in
+    true|false) : ;;
+    *) log ERROR "invalid LOCAL_ONLY value '$LOCAL_ONLY' in $conf (must be 'true' or 'false')"; exit 1 ;;
+  esac
+
+  if [[ $secrets_loaded -ne 0 ]]; then
+    if [[ "$LOCAL_ONLY" == "true" ]]; then
+      log INFO "local-only mode; no target credentials or PROM_GTW available"
+    else
+      log ERROR "secrets file not found: $secrets"
+      log ERROR "required unless LOCAL_ONLY=true (see README)"
+      exit 1
+    fi
+  fi
 
   # STACKS may legitimately be empty (detection-only run). Ensure it exists.
   if [[ -z "${STACKS+x}" ]]; then
@@ -110,6 +130,13 @@ load_config() {
   if [[ -z "${BIND_INCLUDE_NETFS+x}" ]]; then
     BIND_INCLUDE_NETFS=()
   fi
+  if [[ -z "${NO_STOP_STACKS+x}" ]]; then
+    NO_STOP_STACKS=()
+  fi
+  case "$(declare -p NO_STOP_STACKS 2>/dev/null)" in
+    "declare -a"*) : ;;
+    *) log ERROR "NO_STOP_STACKS in $conf must be an indexed array, e.g. NO_STOP_STACKS=( \"stack\" )"; exit 1 ;;
+  esac
 }
 
 # -----------------------------------------------------------------------------
@@ -289,9 +316,11 @@ _compose_action() {
 # -----------------------------------------------------------------------------
 # Build manifest.json (schema 2) for the current stack.
 # Reads: VOL_LINES, COMPOSE_FILE_ENTRIES, CAPTURE_BINDS, EXCLUDED_BINDS.
+# <stopped> ("1"/"0") records whether this archive was taken stop-cold-copy
+# (consistency.stopped=true) or hot per NO_STOP_STACKS (=false).
 # -----------------------------------------------------------------------------
 write_manifest() {
-  local stack="$1" wd="$2" cf="$3"
+  local stack="$1" wd="$2" cf="$3" stopped="${4:-1}"
   local epoch now line name mp entry first
   epoch="$(date +%s)"
   now="$(date -u '+%FT%TZ')"
@@ -369,6 +398,7 @@ write_manifest() {
   "stack": "$(json_escape "$stack")",
   "timestamp": "$now",
   "epoch": $epoch,
+  "consistency": {"stopped": $( [[ "$stopped" == "1" ]] && echo true || echo false )},
   "compose": {
     "working_dir": "$(json_escape "$wd")",
     "config_files": [${cfjson}],
@@ -387,10 +417,12 @@ EOF
 # (so entries can be appended with path prefixes) then gzips it.
 # Sets BACKUP_FILE and TAR_RC. Reads COMPOSE_FILE_ENTRIES, which must already
 # be populated by validate_stack_inputs (called before the stack was stopped).
+# <stopped> ("1"/"0") is forwarded to write_manifest() as-is; defaults to "1"
+# (stop-cold-copy) when omitted.
 # GNU tar (--transform, --append) is required (Linux hosts).
 # -----------------------------------------------------------------------------
 build_stack_archive() {
-  local stack="$1" wd="$2" cf="$3"
+  local stack="$1" wd="$2" cf="$3" stopped="${4:-1}"
   local ts archive tarfile mdir line name mp
   ts="$(date '+%F-%H-%M')"
   archive="$DOCKER_BACKUP_DIR/${NODE_NAME}-${stack}-${ts}.tar.gz"
@@ -402,7 +434,7 @@ build_stack_archive() {
   rm -f "$tarfile"
 
   mdir="$(mktemp -d)"
-  write_manifest "$stack" "$wd" "$cf" > "$mdir/manifest.json"
+  write_manifest "$stack" "$wd" "$cf" "$stopped" > "$mdir/manifest.json"
 
   set +e
   tar --create --file "$tarfile" -C "$mdir" manifest.json
@@ -556,12 +588,12 @@ purge_stack_local() {
 # -----------------------------------------------------------------------------
 # Push per-stack metrics to job/docker_backup/instance/<node>/stack/<stack>.
 # Args: stack managed did_backup archive_success all_targets size volcount down
-#       dur uncovered ignored
+#       dur stopped bind_count bind_bytes excluded_binds network_binds
 # -----------------------------------------------------------------------------
 push_stack_metrics() {
   local stack="$1" managed="$2" did_backup="$3" archive_success="$4" \
-    all_targets="$5" size="$6" volcount="$7" down="$8" dur="$9" \
-    bind_count="${10}" bind_bytes="${11}" excluded_binds="${12}" network_binds="${13}"
+    all_targets="$5" size="$6" volcount="$7" down="$8" dur="$9" stopped="${10}" \
+    bind_count="${11}" bind_bytes="${12}" excluded_binds="${13}" network_binds="${14}"
   local now; now="$(date +%s)"
   local body
   body="$(cat <<EOF
@@ -596,6 +628,17 @@ docker_backup_size_bytes ${size}
 docker_backup_stop_seconds ${down}
 # TYPE docker_backup_duration_seconds gauge
 docker_backup_duration_seconds ${dur}"
+    # docker_backup_stack_stopped describes the consistency of an actual
+    # archive (hot vs stop-cold-copy) -- only meaningful, and only pushed,
+    # when a valid archive was produced this run. A failed stop or failed
+    # input validation must never overwrite it with a value describing an
+    # archive that doesn't exist; PushAdd (POST) leaves the last real
+    # archive's value in place when this metric is omitted from a push.
+    if [[ "$archive_success" -eq 1 ]]; then
+      body+="
+# TYPE docker_backup_stack_stopped gauge
+docker_backup_stack_stopped ${stopped}"
+    fi
     if [[ "$archive_success" -eq 1 && "$all_targets" -eq 1 ]]; then
       body+="
 # TYPE docker_backup_last_success_timestamp_seconds gauge
@@ -612,7 +655,7 @@ backup_stack() {
   local stack="$1"
   local start_epoch downtime_start down=0 dur=0 size=0 volcount=0
   local tar_ok=0 integ=0
-  local stop_ok=0 archive_ok=0 restart_ok=0
+  local stop_ok=0 archive_ok=0 restart_ok=0 stopped=0
   start_epoch="$(date +%s)"
 
   mapfile -t VOL_LINES < <(stack_volumes "$stack")
@@ -627,7 +670,7 @@ backup_stack() {
   if ! validate_stack_inputs "$stack"; then
     dur=$(( $(date +%s) - start_epoch ))
     log ERROR "stack '$stack': input validation failed; aborting backup (stack was not stopped)"
-    push_stack_metrics "$stack" 1 1 0 0 0 "$volcount" 0 "$dur" \
+    push_stack_metrics "$stack" 1 1 0 0 0 "$volcount" 0 "$dur" 0 \
       "$BIND_COUNT" "$BIND_BYTES" "$EXCLUDED_BINDS_COUNT" "$NETWORK_BINDS_COUNT"
     return
   fi
@@ -636,22 +679,37 @@ backup_stack() {
   ctx="$(stack_compose_context "$stack")"
   wd="${ctx%%$'\t'*}"; cf="${ctx#*$'\t'}"
 
-  log INFO "backing up stack '$stack' (${volcount} volume(s), ${BIND_COUNT} bind(s)); stopping it now"
-  downtime_start="$(date +%s)"
-  if _compose_action stop "$stack" "$wd" "$cf"; then
+  local policy
+  stack_stop_policy "$stack"
+  policy="$STOP_POLICY"
+
+  if [[ "$policy" == "no-stop" ]]; then
+    # Hot backup: NO_STOP_STACKS opts this stack out of stop-cold-copy. Never
+    # touch the stack or arm the restart guard -- there is nothing to restart.
     stop_ok=1
-    log INFO "stack '$stack': stop OK"
+    restart_ok=1
+    log INFO "stack '$stack' (${volcount} volume(s), ${BIND_COUNT} bind(s)): hot backup (stack left running, NO_STOP_STACKS)"
   else
-    log ERROR "stack '$stack': failed to stop cleanly"
+    stopped=1
+    # Arm the restart guard *before* attempting the stop, not after it
+    # succeeds: from here until a start attempt has run below, any unexpected
+    # exit (shell error, signal) triggers a best-effort restart via
+    # restart_guard_run() in the EXIT trap. This also covers an interruption
+    # or partial failure of the stop command itself, not just the archiving
+    # window after a successful stop.
+    RESTART_GUARD_STACK="$stack"; RESTART_GUARD_WD="$wd"; RESTART_GUARD_CF="$cf"
+    log INFO "backing up stack '$stack' (${volcount} volume(s), ${BIND_COUNT} bind(s)); stopping it now"
+    downtime_start="$(date +%s)"
+    if _compose_action stop "$stack" "$wd" "$cf"; then
+      stop_ok=1
+      log INFO "stack '$stack': stop OK"
+    else
+      log ERROR "stack '$stack': failed to stop cleanly"
+    fi
   fi
 
   if [[ $stop_ok -eq 1 ]]; then
-    # Arm the restart guard: from here until a start attempt has run below,
-    # any unexpected exit (shell error, signal) triggers a best-effort
-    # restart via restart_guard_run() in the EXIT trap.
-    RESTART_GUARD_STACK="$stack"; RESTART_GUARD_WD="$wd"; RESTART_GUARD_CF="$cf"
-
-    build_stack_archive "$stack" "$wd" "$cf"
+    build_stack_archive "$stack" "$wd" "$cf" "$stopped"
     [[ ${TAR_RC:-1} -le 1 ]] && tar_ok=1
 
     if [[ -s "$BACKUP_FILE" ]] && gzip -t "$BACKUP_FILE" 2>/dev/null; then
@@ -667,23 +725,39 @@ backup_stack() {
     log ERROR "stack '$stack': stop failed; skipping archive"
   fi
 
-  # Best-effort restart regardless of stop/archive outcome, then clear the
-  # guard -- a start attempt has now run, whether or not it succeeded.
-  if _compose_action start "$stack" "$wd" "$cf"; then
-    restart_ok=1
-    log INFO "stack '$stack': restart OK"
-  else
-    log ERROR "stack '$stack': failed to restart"
+  if [[ $stopped -eq 1 ]]; then
+    # Best-effort restart regardless of stop/archive outcome, then clear the
+    # guard -- a start attempt has now run, whether or not it succeeded. Only
+    # reached for stacks this run actually stopped (gated on $stopped): a hot
+    # backup never called stop, so it must never call start either.
+    if _compose_action start "$stack" "$wd" "$cf"; then
+      restart_ok=1
+      log INFO "stack '$stack': restart OK"
+    else
+      log ERROR "stack '$stack': failed to restart"
+    fi
+    RESTART_GUARD_STACK=""
+    down=$(( $(date +%s) - downtime_start ))
   fi
-  RESTART_GUARD_STACK=""
-  down=$(( $(date +%s) - downtime_start ))
 
   purge_stack_local "$stack"
 
   # Delivery only depends on having a valid archive (stop_ok && archive_ok):
   # a restart failure doesn't invalidate an already-built archive, and target
   # metrics describe delivery independently of overall stack success.
-  if [[ $stop_ok -eq 1 && $archive_ok -eq 1 ]]; then
+  if [[ "${LOCAL_ONLY:-false}" == "true" ]]; then
+    if [[ $stop_ok -eq 1 && $archive_ok -eq 1 ]]; then
+      log INFO "stack '$stack': local-only mode; archive retained at ${BACKUP_FILE:-$DOCKER_BACKUP_DIR}"
+      STACK_TARGETS_TOTAL=0
+      STACK_TARGETS_OK=0
+      STACK_ALL_TARGETS_OK=1
+    else
+      log ERROR "stack '$stack': local-only mode; no valid archive to retain (stop_ok=${stop_ok} archive_ok=${archive_ok})"
+      STACK_TARGETS_TOTAL=0
+      STACK_TARGETS_OK=0
+      STACK_ALL_TARGETS_OK=0
+    fi
+  elif [[ $stop_ok -eq 1 && $archive_ok -eq 1 ]]; then
     send_stack_to_targets "$stack"
   else
     log ERROR "stack '$stack': skipping target delivery (stop_ok=${stop_ok} archive_ok=${archive_ok})"
@@ -700,7 +774,7 @@ backup_stack() {
 
   dur=$(( $(date +%s) - start_epoch ))
   log INFO "stack '$stack' done: stop=${stop_ok} archive=${archive_ok} restart=${restart_ok} success=${overall_ok} all_targets=${STACK_ALL_TARGETS_OK} (${STACK_TARGETS_OK}/${STACK_TARGETS_TOTAL}) size=${size}B downtime=${down}s"
-  push_stack_metrics "$stack" 1 1 "$overall_ok" "$STACK_ALL_TARGETS_OK" "$size" "$volcount" "$down" "$dur" \
+  push_stack_metrics "$stack" 1 1 "$overall_ok" "$STACK_ALL_TARGETS_OK" "$size" "$volcount" "$down" "$dur" "$stopped" \
     "$BIND_COUNT" "$BIND_BYTES" "$EXCLUDED_BINDS_COUNT" "$NETWORK_BINDS_COUNT"
 }
 
@@ -713,6 +787,19 @@ warn_stale_bind_ignore() {
     [[ -n "${BIND_IGNORE[$i]}" ]] || continue
     if [[ -z "${BIND_IGNORE_HITS[$i]:-}" ]]; then
       log WARNING "stale BIND_IGNORE entry (matched nothing): ${BIND_IGNORE[$i]}"
+    fi
+  done
+}
+
+# -----------------------------------------------------------------------------
+# Warn about NO_STOP_STACKS entries that matched nothing this run.
+# -----------------------------------------------------------------------------
+warn_stale_no_stop_stacks() {
+  local i
+  for i in "${!NO_STOP_STACKS[@]}"; do
+    [[ -n "${NO_STOP_STACKS[$i]}" ]] || continue
+    if [[ -z "${NO_STOP_STACKS_HITS[$i]:-}" ]]; then
+      log WARNING "stale NO_STOP_STACKS entry (matched nothing): ${NO_STOP_STACKS[$i]}"
     fi
   done
 }
@@ -767,6 +854,10 @@ main() {
   # Preflight: probe target credentials/reachability and exit (no backup).
   if [[ -n "${CHECK_TARGETS:-}" ]]; then
     load_config
+    if [[ "${LOCAL_ONLY:-false}" == "true" ]]; then
+      echo "local-only mode; no targets to check"
+      exit 0
+    fi
     if check_targets; then exit 0; else exit 1; fi
   fi
 
@@ -798,6 +889,11 @@ main() {
     BIND_IGNORE_HITS[$i]=""
   done
 
+  # Initialize NO_STOP_STACKS hit tracking.
+  for i in "${!NO_STOP_STACKS[@]}"; do
+    NO_STOP_STACKS_HITS[$i]=""
+  done
+
   local s
   # Back up managed stacks (or, in dry-run, evaluate them without downtime).
   for s in "${STACKS[@]:-}"; do
@@ -808,8 +904,12 @@ main() {
     if [[ -n "${DRY_RUN:-}" ]]; then
       mapfile -t VOL_LINES < <(stack_volumes "$s")
       classify_stack_binds "$s"
-      log INFO "DRY_RUN: would back up '$s' (${#VOL_LINES[@]} volume(s))"
-      push_stack_metrics "$s" 1 0 0 0 0 "${#VOL_LINES[@]}" 0 0 \
+      local _dry_policy _dry_stopped=0
+      stack_stop_policy "$s"
+      _dry_policy="$STOP_POLICY"
+      [[ "$_dry_policy" == "stop" ]] && _dry_stopped=1
+      log INFO "DRY_RUN: would back up '$s' (${#VOL_LINES[@]} volume(s), policy=${_dry_policy})"
+      push_stack_metrics "$s" 1 0 0 0 0 "${#VOL_LINES[@]}" 0 0 "$_dry_stopped" \
         "$BIND_COUNT" "$BIND_BYTES" "$EXCLUDED_BINDS_COUNT" "$NETWORK_BINDS_COUNT"
     else
       backup_stack "$s"
@@ -828,11 +928,12 @@ main() {
       UNMANAGED_COUNT=$((UNMANAGED_COUNT + 1))
       log WARNING "UNMANAGED stateful stack (owns named volumes or bind-mount state, not in STACKS): $s"
     fi
-    push_stack_metrics "$s" 0 0 0 0 0 0 0 0 \
+    push_stack_metrics "$s" 0 0 0 0 0 0 0 0 0 \
       "$BIND_COUNT" 0 "$EXCLUDED_BINDS_COUNT" "$NETWORK_BINDS_COUNT"
   done
 
   warn_stale_bind_ignore
+  warn_stale_no_stop_stacks
   push_detector_metrics
   log INFO "docker-compose backup finished: managed=${#STACKS[@]} unmanaged=${UNMANAGED_COUNT} failed=${FAILED_STACKS}"
 

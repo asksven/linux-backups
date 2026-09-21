@@ -1,15 +1,17 @@
 # Plans
 
 > **Current system:** see [ARCHITECTURE.md](ARCHITECTURE.md). This file retains
-> the implemented self-contained Docker backup phases as context for the pending
-> correctness-hardening work in Phase 6.
+> the implemented self-contained Docker backup phases as context for the
+> outstanding work in [Phase 7](#phase-7--docker-compose-mvp-local-only--optional-stop--config-tooling).
 
 # Plan: Self-contained Docker stack backups (decouple from host FS backup)
 
-> **Status: PHASES 1–6 IMPLEMENTED.** Phases 1–5 reworked the Docker stack
-> backup's bind-mount handling and related restore, metrics, alerts, and docs.
-> Phase 6 addressed correctness findings from the post-implementation
-> architecture review, including a contract test suite under `tests/`.
+> **Status: PHASES 1–6 IMPLEMENTED AND VERIFIED** (code-checked 2026-09-19).
+> Phases 1–5 reworked the Docker stack backup's bind-mount handling and related
+> restore, metrics, alerts, and docs. Phase 6 addressed correctness findings from
+> the post-implementation architecture review, including a contract test suite
+> under `tests/`. **Phase 7 (below) is the remaining work** for the
+> docker-compose MVP.
 
 ## Problem (current, flawed architecture)
 
@@ -238,9 +240,10 @@ No new fstypes needed — `cifs` is already in the network set.
 ## Phase 6 — Correctness hardening after implementation review
 
 Phases 1–5 implemented the intended archive format and workflow, but the review
-found several paths that can still produce an incomplete archive, report a
-failed operation as successful, or restore the wrong filesystem shape. This
-phase is required before treating schema-2 archives as reliable DR units.
+found several paths that could still produce an incomplete archive, report a
+failed operation as successful, or restore the wrong filesystem shape. All of it
+is now implemented; this section is retained as the behavioural contract for
+schema-2 archives as reliable DR units.
 
 ### Confirmed failure policy
 
@@ -255,137 +258,25 @@ These choices were confirmed by the maintainer on 2026-07-19:
 - Bind-only Compose projects are first-class stateful stacks: **back up managed
   bind-only stacks and alert on unmanaged bind-only stacks**.
 
-### Must fix (red)
+### Findings — all implemented (code-verified 2026-09-19)
 
-18. **Back up and detect bind-only stacks** (`docker-backup.sh`,
-    `docker-backup-init.sh`):
-    - Remove the `volcount == 0` early return in `backup_stack()`. A managed
-      project with compose files and/or captured binds must run the same
-      stop/archive/start/deliver flow with an empty `volumes[]` array.
-    - Define a stateful project as one with at least one named volume or at least
-      one non-ephemeral bind after discovery. Use the same definition for the
-      unmanaged detector and reconciler/bootstrap suggestions.
-    - Do not auto-manage projects whose only mounts are ephemeral/system binds.
-    - Ensure metrics for bind-only stacks report `volume_count=0`, the real bind
-      counters/bytes, and normal backup success/target status.
+The detailed findings have been collapsed now that each is in the codebase. What
+they changed, with the landing site for future reference:
 
-19. **Represent and restore file binds correctly** (`docker-backup.sh`,
-    `restore.sh`, manifest schema 2):
-    - Add bind source kind metadata, e.g. `kind: "file" | "directory"`, to each
-      captured `binds[]` entry. Determine it before writing the manifest.
-    - Directory binds keep the current `binds/<id>/...` layout and restore into
-      a directory.
-    - File binds must restore to the exact source filename, not to a directory
-      named after that file. With `--bind-root /restore`, `/etc/app/config.yml`
-      must become `/restore/etc/app/config.yml`.
-    - Create only the parent directory for a file bind, extract to a temporary
-      location if needed, then install/move the file while preserving numeric
-      owner and mode. Refuse to replace an incompatible existing path unless
-      `--force` is set.
-    - Continue accepting existing schema-2 manifests without `kind`: infer file
-      versus directory from archive members, or fail with a clear actionable
-      message if inference is ambiguous.
+| # | Finding | Landed as |
+|---|---|---|
+| 18 | Back up and detect bind-only stacks | `volcount == 0` early return dropped from `backup_stack()`; `stack_is_stateful()` (volume **or** non-ephemeral bind) shared by the runtime, the unmanaged detector and the reconciler |
+| 19 | Represent and restore file binds correctly | `kind: file\|directory` per `binds[]` entry via `_bind_kind()`; `restore.sh` `_infer_bind_kind()` covers pre-`kind` manifests and errors clearly when ambiguous |
+| 20 | Missing/unreadable inputs fatal | `validate_stack_inputs()` runs before the stop; the bind tar loop assigns `_rc` per branch and folds it into `TAR_RC` |
+| 21 | Stop/start state transitions | explicit `stop_ok` / `archive_ok` / `restart_ok`; `RESTART_GUARD_STACK` EXIT-trap guard armed only after a successful stop |
+| 22 | Restore the captured Compose invocation | `manifest_captured_files()` maps every `config_files[]` entry, aborts on mismatch, and emits `-f` args in the original order |
+| 23 | Fail-safe restore overwrite | `_assert_safe_members()` rejects absolute and `..` members; `--force` clears the target first (replace, not merge) |
+| 24 | One bind-classification implementation | `bind_capture_verdict()` in `lib.sh`, called by both the runtime and `docker-backup-init.sh` |
+| 25 | Bind metrics and duplicate sources | `network-forced` binds counted into `BIND_BYTES`; unique sources archived once with a `mounts[]` array; README documents the unique-source definition |
+| 26 | Contract tests | five files under `tests/`, including round-trip restore and a schema-1 fixture |
+| 27 | Stale comments and plan state | `docker-backup.sh` header flow and the `stack_bind_mounts` comment updated (one stale `azcopy copy` mention remains — see Phase 7 item 50) |
 
-20. **Make missing or unreadable inputs fatal to archive success**
-    (`docker-backup.sh`, `lib.sh`):
-    - Resolve and validate all named-volume mountpoints, compose files, and
-      capture-selected bind sources before stopping the stack.
-    - A labelled compose config file that is missing/unreadable is a hard
-      failure; do not silently omit it from `COMPOSE_FILE_ENTRIES`.
-    - A capture-selected bind that disappears, changes kind, or becomes
-      unreadable before/during tar is a hard archive failure. Never retain it in
-      `manifest.binds[]` while omitting its data.
-    - Fix the bind tar loop so every branch assigns its own return code. Do not
-      reuse a stale `_rc` after the missing-source branch.
-    - On any tar/input failure, remove the incomplete archive, restart the stack,
-      skip target delivery, and push failure metrics.
-
-21. **Enforce stop/start state transitions and success semantics**
-    (`docker-backup.sh`):
-    - Track explicit per-stack state such as `stop_ok`, `archive_ok`, and
-      `restart_ok`; do not derive overall success from tar/gzip alone.
-    - If stop fails, do not call `build_stack_archive` or target delivery. Attempt
-      a best-effort start, then push `docker_backup_success=0`.
-    - Install a per-stack cleanup/restart guard immediately after a successful
-      stop so shell errors, signals, or archive failures cannot leave the stack
-      stopped. Clear the guard only after a successful start attempt has run.
-    - If restart fails after a valid archive was built, still run integrity
-      verification and target delivery, but push `docker_backup_success=0`.
-      Target metrics continue to describe delivery independently.
-    - Log stop, archive, restart, and delivery outcomes separately. The process
-      should finish non-zero if any managed stack failed, while still processing
-      later stacks where safe.
-
-22. **Restore the captured Compose invocation, not only basenames**
-    (`restore.sh`, manifest writer):
-    - Parse `compose.captured_files[]` with the structured JSON parser and map
-      every original config path to its archived/restored filename, including
-      basename-collision prefixes.
-    - Print a runnable command containing the required `-f <restored-file>`
-      arguments in the original `compose.config_files[]` order. Do not assume
-      plain `docker compose up -d` loads collision-renamed or non-default files.
-    - Fail compose restore if a manifest-declared captured file is absent from
-      the archive. Do not claim a full restore after partial extraction.
-    - Keep the documented limitation that `env_file:` files are not discovered,
-      but change broad “everything needed” claims to state that only labelled
-      Compose config files plus top-level `.env` are captured.
-
-### Recommended fixes (yellow)
-
-23. **Make restore overwrite behavior explicit and fail-safe** (`restore.sh`):
-    - Without `--force`, encountering any non-empty target volume, existing bind
-      target, missing selected volume, or extraction failure must make the
-      command exit non-zero; collect errors if continuing to inspect later items.
-    - Define `--force` as replacement, not merge: clear the target volume or bind
-      directory before extraction so files removed since the backup do not
-      survive the restore. Never clear outside the exact validated target path.
-    - Validate archive member paths before extraction and reject absolute paths
-      or `..` traversal entries.
-
-24. **Use one bind-classification implementation everywhere** (`lib.sh`,
-    `docker-backup.sh`, `docker-backup-init.sh`):
-    - Extract the precedence decision into a shared helper used by runtime and
-      reconciler reporting.
-    - The shared order must remain: ephemeral skip → network-fs exclusion unless
-      `BIND_INCLUDE_NETFS` matches → `BIND_IGNORE` → capture.
-    - `docker-backup-init.sh` must honor `BIND_INCLUDE_NETFS` and show a distinct
-      force-capture verdict. Its suggestions must use the same decision.
-
-25. **Correct bind metrics and duplicate-source handling** (`docker-backup.sh`,
-    manifest schema 2):
-    - Include force-captured network binds in `BIND_BYTES`.
-    - Archive identical source data once even when several containers or
-      destinations mount it. Preserve all destination/RO relationships in the
-      manifest, either as a `mounts[]` list on one source record or another
-      explicit normalized structure.
-    - Define `docker_backup_bind_count` as unique captured sources and document
-      that definition. Excluded/network counters should follow the same unique
-      source rule to avoid container-count-dependent metrics.
-
-26. **Add executable archive/restore contract tests**:
-    - Add a test harness suitable for Bash (Bats is acceptable) with Docker
-      commands stubbed where a daemon is unnecessary.
-    - Cover schema-2 manifest validity, empty volumes, bind-only stacks, empty
-      directories, file binds, duplicate sources, compose basename collisions,
-      missing compose/bind sources, and path names containing spaces.
-    - Cover stop failure, archive failure after stop, restart failure with valid
-      delivery, and the restart guard.
-    - Build a synthetic archive and perform a round-trip restore under a temp
-      root. Assert exact file/directory shape, contents, modes, config-file order,
-      `--bind-root`, `--project-dir`, `--no-binds`, `--no-compose`, and
-      replacement semantics with/without `--force`.
-    - Retain a schema-1 fixture because the implementation and confirmed
-      decision support schema-1 restore.
-
-### Nice to have (green)
-
-27. **Clean stale comments and plan state**:
-    - Update the `docker-backup.sh` header flow to mention compose files and bind
-      data rather than named volumes only.
-    - Update the `stack_bind_mounts` comment to say writable and read-only binds.
-    - Keep the plan status current as Phase 6 items are completed.
-
-### Phase 6 acceptance criteria
+### Phase 6 behaviour contracts (keep as regression guard)
 
 1. A managed bind-only test stack produces and delivers a valid schema-2 archive;
    an equivalent unmanaged project increments `docker_backup_unmanaged_stacks`.
@@ -463,3 +354,328 @@ All five were confirmed by the maintainer — implement exactly as stated:
   skipped); live DB dumps (still stop-cold-copy); volumes on non-`local` drivers;
   parsing `env_file:` / compose files outside `working_dir`; automatic removal of
   now-redundant `INCLUDE_PATHS` entries from host configs.
+
+---
+
+# Phase 7 — docker-compose MVP: local-only, optional stop, config tooling
+
+> **Status: IMPLEMENTED (7A–7D complete, 2026-09-20).** Scoped 2026-09-19
+> against the four MVP criteria below. All items 28–50 landed: `LOCAL_ONLY`,
+> `NO_STOP_STACKS` + `consistency.stopped`, `docker-backup-init.sh --check` and
+> combined `STACKS`/`BIND_IGNORE`/`NO_STOP_STACKS` auto-append, the dashboard
+> panel, and tests (`test_local_only.sh`, `test_stop_policy.sh`,
+> `test_init_check.sh`, plus extensions to `test_manifest_and_archive.sh` and
+> `test_restore_roundtrip.sh`). A real bug was found and fixed during test
+> authoring: `stack_stop_policy()` originally returned its verdict via `echo`
+> for command-substitution capture, which silently discarded its
+> `NO_STOP_STACKS_HITS` side effect in the forked subshell — fixed to set a
+> `STOP_POLICY` global instead (same pattern as `bind_capture_verdict`).
+
+## MVP criteria and current state
+
+| # | Criterion | State |
+|---|---|---|
+| 1 | Docker backups are self-contained; no reliance on the host FS backup | **Done** (Phases 1–6) |
+| 2 | Each run produces local files; no cloud/NAS sync required | **~90%** — the tarball is always written to `DOCKER_BACKUP_DIR` and pruned by `RETENTION_DAYS`, the pushgateway no-ops on an empty `PROM_GTW`, and there is no `azcopy`/`rsync` preflight. But `send_stack_to_targets()` logs `ERROR "no targets configured"` every run and sets `STACK_ALL_TARGETS_OK=0`. `docker_backup_success` is unaffected (it tracks archive/overall success), so no alert fires — it is log noise plus a misleading dashboard value. There is no way to declare "local only" as intent. |
+| 3 | Per-stack choice to stop or not stop the stack around the backup | **Missing** — the stop is unconditional in `backup_stack()`; only a global `STOP_TIMEOUT` exists; `STACKS` is a plain name array with no per-entry qualifiers |
+| 4 | Tooling to create the initial config and suggest additions for new stacks | **~70%** — `docker-backup-init.sh` bootstraps from the template and additively appends `STACKS+=( … )`, and reports per-bind fstype/verdict/size. But `BIND_IGNORE` suggestions are print-only, there is no non-interactive drift check for cron/CI, and it knows nothing about a stop policy |
+
+## Decisions (confirmed 2026-09-19)
+
+1. **Stop policy syntax** — a separate `NO_STOP_STACKS=( "immich" )` array.
+   Keeps `STACKS` a plain name list, is backwards compatible, and is trivial for
+   the init tooling to append to. (Rejected: `"immich:hot"` qualifiers inside
+   `STACKS`, which would need parsing at every read site; and a
+   `STACK_STOP[immich]=false` associative array, which is more verbose.)
+2. **Local-only** — an explicit `LOCAL_ONLY=true` flag rather than silently
+   downgrading the zero-targets `ERROR`, so a genuinely broken target setup is
+   still detected on hosts that *do* expect delivery.
+3. **Init tooling** — `--write`/`--yes` appends `STACKS`, `BIND_IGNORE` **and**
+   `NO_STOP_STACKS` suggestions, not just `STACKS`.
+4. **Drift detection** — add a `--check` mode that exits non-zero on drift, for
+   cron/systemd-timer/CI, alongside the existing `DockerBackupUnmanagedStack`
+   alert.
+5. **Manifest** — the stop policy is recorded as an *additive optional* field.
+   **No schema bump**: schema stays 2 so schema-1 and older schema-2 archives
+   keep restoring unchanged.
+
+## Phase 7A — Local-only operation
+
+Independent of 7B; the two can be implemented in parallel.
+
+28. `conf/docker-backup.example.conf`: add a documented `LOCAL_ONLY=false` near
+    `DOCKER_BACKUP_DIR` / `RETENTION_DAYS`. Explain that archives then stay on
+    this host only, retention is `RETENTION_DAYS`, and neither `conf/targets/`
+    nor `secrets.env` is required.
+29. `docker-backup.sh` `load_config()`: default `LOCAL_ONLY="${LOCAL_ONLY:-false}"`.
+30. `docker-backup.sh` `backup_stack()` delivery block: when `LOCAL_ONLY` is
+    true, skip `send_stack_to_targets` entirely, log INFO
+    `"local-only mode; archive retained at <path>"`, and set
+    `STACK_TARGETS_TOTAL=0`, `STACK_TARGETS_OK=0`, **`STACK_ALL_TARGETS_OK=1`**
+    so dashboards do not show a phantom delivery failure. Leave the existing
+    zero-targets `ERROR` branch in `send_stack_to_targets()` untouched for
+    non-local-only runs.
+31. `--check-targets`: print `"local-only mode; no targets to check"` and exit 0
+    instead of reporting the absence of targets as a problem.
+32. Docs: `README.md` ("Docker Compose backups") and `ARCHITECTURE.md` — document
+    `LOCAL_ONLY` as the supported MVP mode, and state plainly that DR then
+    depends on this host's disk alone.
+
+## Phase 7B — Per-stack stop policy
+
+Item 34 blocks 35–39.
+
+33. `conf/docker-backup.example.conf`: add a commented `NO_STOP_STACKS=()` block.
+    Document it as "back up these stacks **hot** (no downtime) — only safe when
+    the stack cannot write inconsistent state while tar runs: no embedded
+    database, no SQLite/WAL, no long-running writers". State that the default
+    remains stop-cold-copy.
+34. `lib.sh`: new `stack_stop_policy <stack>` printing `stop` or `no-stop`.
+    Match `NO_STOP_STACKS` entries by exact name or glob, reusing the matching
+    style of `bind_ignored()` / `bind_include_netfs()`, including the same
+    optional hit-tracking so a stale entry can be warned about (mirror
+    `warn_stale_bind_ignore()` in `docker-backup.sh`).
+35. `docker-backup.sh` `backup_stack()`: introduce an explicit `stopped` flag,
+    distinct from `stop_ok`, and resolve the policy after `validate_stack_inputs`
+    (which stays unconditional).
+    - `no-stop`: skip `_compose_action stop`, do **not** arm the restart guard
+      (`RESTART_GUARD_STACK` stays empty), do **not** call
+      `_compose_action start`; set `stop_ok=1`, `restart_ok=1`, `down=0`; log
+      INFO `"hot backup (stack left running)"`.
+    - `stop`: unchanged path.
+    - Note: `_compose_action start` currently runs *unconditionally*, even when
+      the stop failed. Gate it on `stopped`.
+    - `overall_ok` still requires `archive_ok`.
+36. Metrics: add `docker_backup_stack_stopped` (1/0) to `push_stack_metrics()`
+    and every call site — the two in `backup_stack()` plus the dry-run branch in
+    the `STACKS` loop. `docker_backup_stop_seconds` stays 0 for hot stacks.
+37. `write_manifest()`: emit an additive optional
+    `"consistency": {"stopped": true|false}`. Schema stays **2**; `restore.sh`
+    must tolerate its absence in older archives.
+38. `restore.sh`: read `consistency.stopped` and print a prominent warning when
+    it is false — the archive is crash-consistent only. No other behaviour change.
+39. `dashboards/linux-backups.json`: a stat panel on
+    `docker_backup_stack_stopped` to distinguish hot from cold stacks. No new
+    alert rule.
+
+## Phase 7C — Config tooling
+
+Depends on item 34 for the shared policy helper.
+
+40. `docker-backup-init.sh`: new `--check` mode. Non-interactive, writes nothing,
+    prints drift, and **exits 1** when a running stateful project is missing from
+    `STACKS` or a configured stack no longer exists; exits 0 when in sync. Reuse
+    the existing `discover_compose_projects()` / `stack_is_stateful()` comparison.
+41. Generalise `append_stacks()` into
+    `append_entries <conf> <array-name> <values…>` so one dated comment block can
+    carry `STACKS+=( … )`, `BIND_IGNORE+=( … )` and `NO_STOP_STACKS+=( … )`.
+    `apply_append()` keeps the `.bak-<ts>` backup; `create_conf()` keeps working
+    from the template.
+42. Wire `suggest_bind_ignore()` output into the writer so `--write` / `--yes`
+    actually appends `BIND_IGNORE` entries (today they are printed only).
+43. New `suggest_stop_policy()`: per stack, report the effective policy via
+    `stack_stop_policy()`, and propose `NO_STOP_STACKS` candidates
+    **conservatively** — only when no database signature is found. Inspect
+    `.Config.Image` of the stack's containers for
+    `postgres|mysql|mariadb|mongo|redis|influx|elastic`, and scan captured bind
+    and volume roots for `*.sqlite*`, `*.db`, and WAL files. Anything matching →
+    recommend keeping the stop. Print the reasoning per stack; never append
+    without `--write` or explicit confirmation.
+44. Ship a cron / systemd-timer sample for `docker-backup-init.sh --check`
+    (README section plus a commented unit or crontab snippet), noting that init
+    itself stays manual-only for writes.
+
+## Phase 7D — Tests and docs
+
+Depends on 7A–7C.
+
+45. `tests/test_stop_policy.sh` (new): a stack in `NO_STOP_STACKS` makes no
+    stop/start calls (assert via the docker stub in `tests/stub_lib.sh`), never
+    arms the restart guard, reports downtime 0 and
+    `docker_backup_stack_stopped=0`, writes `consistency.stopped=false` into the
+    manifest, and still builds and delivers the archive. Cover the cold inverse
+    and a stale-`NO_STOP_STACKS`-entry warning.
+46. `tests/test_local_only.sh` (new): `LOCAL_ONLY=true` → `send_stack_to_targets`
+    not called, no ERROR logged, `STACK_ALL_TARGETS_OK=1`, tarball present in
+    `DOCKER_BACKUP_DIR`. `LOCAL_ONLY=false` with zero targets → the ERROR is
+    preserved.
+47. Extend `tests/test_manifest_and_archive.sh` for the `consistency` field, and
+    `tests/test_restore_roundtrip.sh` for the hot-archive warning plus a fixture
+    that lacks `consistency` (backwards compatibility).
+48. Add an init `--check` exit-code test: drift → 1, in sync → 0.
+49. Docs: `README.md` (`LOCAL_ONLY`, `NO_STOP_STACKS`, the `--check` workflow,
+    the new metric) and `ARCHITECTURE.md` (stop policy and local-only in the
+    Docker stack backup and metrics sections).
+50. Leftover from item 27: step 4 of the `docker-backup.sh` header flow still
+    ends with `-> azcopy copy`, which predates the pluggable target layer —
+    delivery goes through `list_targets()` / `target_send()` and supports rsync
+    too. Reword it to "deliver to configured targets" while the same header is
+    being touched for `LOCAL_ONLY`.
+
+## Phase 7 acceptance criteria
+
+1. With `LOCAL_ONLY=true` and no targets configured, a run completes with no
+   ERROR lines, leaves a valid tarball in `DOCKER_BACKUP_DIR`, and reports
+   `docker_backup_success=1`.
+2. With `LOCAL_ONLY=false` and no targets configured, the existing
+   "no targets configured" ERROR still appears.
+3. A stack listed in `NO_STOP_STACKS` is never stopped (`docker ps` uptime is
+   uninterrupted), yields `docker_backup_stop_seconds=0`,
+   `docker_backup_stack_stopped=0`, and a manifest with
+   `consistency.stopped=false`, and still produces a restorable archive.
+4. A stack **not** listed keeps the exact current stop-cold-copy behaviour,
+   including the restart guard.
+5. `restore.sh` warns when restoring a hot archive and restores older archives
+   without a `consistency` field unchanged.
+6. `docker-backup-init.sh --check` exits 0 in sync and 1 on drift; `--write`
+   appends `STACKS`, `BIND_IGNORE` and `NO_STOP_STACKS` suggestions under one
+   dated block and leaves a `.bak-<ts>`.
+   > **Amended by follow-up items 51/52 (2026-09-20):** `--write`/`--yes`
+   > applies `STACKS` drift unconditionally, but `BIND_IGNORE`/`NO_STOP_STACKS`
+   > suggestions are heuristics and are only applied with the added
+   > `--apply-bind-ignore`/`--apply-stop-policy` flags (or per-suggestion
+   > interactive approval) — never just because `--write`/`--yes` was passed.
+7. `tests/run_all.sh` passes including the two new test files; `shellcheck`
+   passes on every changed script; the manifest JSON still validates and still
+   reports `"schema": 2`.
+
+## Phase 7 verification
+
+1. `cd tests && ./run_all.sh` — all files green, including the new ones.
+2. `bash -n` on every changed script; `shellcheck` if available.
+3. On a real Docker host: configure one stack in `NO_STOP_STACKS` with
+   `LOCAL_ONLY=true`, run `docker-backup.sh`, and confirm the stack never went
+   down, the log says hot backup, a tarball lands in `DOCKER_BACKUP_DIR`, and no
+   "no targets configured" ERROR appears.
+4. `tar -xOf <archive> manifest.json | python3 -m json.tool` — verify
+   `consistency.stopped=false` and `"schema": 2`.
+5. `restore.sh --project-dir /tmp/r --bind-root /tmp/r <archive>` — the
+   hot-archive warning is printed and files are restored.
+6. `docker-backup-init.sh --check` → 0 when in sync; add a throwaway compose
+   stack → 1 with the stack listed; `--write` appends it plus any suggestions.
+
+## Phase 7 scope
+
+- **Included**: `LOCAL_ONLY` mode; per-stack `NO_STOP_STACKS` policy; the
+  `consistency` manifest field and `docker_backup_stack_stopped` metric;
+  `docker-backup-init.sh --check` and richer auto-append; the dashboard panel;
+  tests and docs for all of the above.
+- **Excluded**: any change to target delivery (`conf/targets/`, azcopy, rsync
+  retention); encryption; `env_file:` discovery; multi-node orchestration; any
+  change to the host `backup.sh`; a manifest schema version bump.
+
+## Phase 7 file map
+
+| File | Touch points |
+|---|---|
+| `docker-backup.sh` | `backup_stack()` (stop/guard/start/delivery sequencing), `send_stack_to_targets()`, `push_stack_metrics()`, `write_manifest()`, `warn_stale_bind_ignore()`, the `STACKS` loop, `load_config()`, the file header flow |
+| `lib.sh` | new `stack_stop_policy()`; reuse the matching style of `bind_ignored()` / `bind_include_netfs()`. `list_targets()`'s legacy `__compat__` shim and `pushgateway_post()` already degrade cleanly — leave them alone |
+| `restore.sh` | `consistency.stopped` warning in the schema-2 path |
+| `docker-backup-init.sh` | flag parsing, `append_stacks()` → `append_entries()`, `create_conf()`, `apply_append()`, `suggest_bind_ignore()`, new `suggest_stop_policy()`, new `--check` mode |
+| `conf/docker-backup.example.conf` | `LOCAL_ONLY`, `NO_STOP_STACKS` |
+| `tests/` | new `test_stop_policy.sh`, `test_local_only.sh`; extend `test_manifest_and_archive.sh`, `test_restore_roundtrip.sh`; harness/stubs as needed |
+| `README.md`, `ARCHITECTURE.md`, `dashboards/linux-backups.json` | docs and the hot/cold panel |
+
+# Phase 7 follow-up — post-implementation review
+
+> **Status: Must fix (51–55) and should fix (56–60) IMPLEMENTED 2026-09-20.**
+> Review findings recorded 2026-09-20. `docker-backup-init.sh` gained
+> `--apply-bind-ignore`/`--apply-stop-policy` opt-in flags (BIND_IGNORE
+> and NO_STOP_STACKS suggestions are no longer auto-applied by `--write`/
+> `--yes`); the reconcile early-return no longer discards suggestion-only
+> changes; `docker-backup.sh` now arms the restart guard before calling
+> `docker compose stop` instead of after it returns success; new tests added:
+> `tests/test_init_writer.sh` and two cases in `tests/test_backup_stack_failures.sh`
+> (`test_stop_failure_still_attempts_restart`,
+> `test_restart_guard_armed_before_stop_is_attempted`).
+> `docker_backup_stack_stopped` is now only pushed alongside a valid archive;
+> `LOCAL_ONLY` local-only delivery no longer claims retention without a valid
+> archive; `load_config()` validates `LOCAL_ONLY` and `NO_STOP_STACKS`;
+> reconcile reports "no additions to make" instead of "in sync" when only
+> stale (`GONE`) entries exist; `--check` treats a missing config as drift
+> even with nothing currently running. New tests: `tests/test_config_validation.sh`,
+> plus additions to `tests/test_backup_stack_failures.sh`, `tests/test_local_only.sh`,
+> `tests/test_init_check.sh`, and `tests/test_init_writer.sh`. `tests/run_all.sh`
+> passes (10 files).
+
+## Must fix — IMPLEMENTED 2026-09-20
+
+51. Make `BIND_IGNORE` suggestions advisory by default. `suggest_bind_ignore()`
+   currently treats a source shared by several stacks as a global exclusion
+   candidate; accepting that suggestion can exclude the source from every
+   stack and leave no backup copy. Broad transient-path matches carry the same
+   data-loss risk. Keep objective `STACKS` drift auto-fixable, but require an
+   explicit per-category opt-in or interactive approval before appending
+   `BIND_IGNORE`. Prefer stack-scoped entries when only one stack should omit a
+   shared source.
+52. Make `NO_STOP_STACKS` suggestions advisory by default.
+   `_stack_looks_stateful_db()` only proves that a shallow best-effort scan
+   found no known signature; unreadable roots, files below the scan depth,
+   unknown database images, and arbitrary writers can all produce false-safe
+   hot candidates. `--write` must not silently weaken consistency. Require an
+   explicit opt-in or interactive approval, treat scan/access errors as
+   stop-cold-copy, and document that the result is a hint rather than a safety
+   proof.
+53. Fix reconciliation so suggestion-only changes are not discarded. The
+   existing-config path returns when `UNMANAGED` is empty before mode handling,
+   so `--write` cannot append approved `BIND_IGNORE` or `NO_STOP_STACKS`
+   suggestions unless a new stack also exists. Determine all pending groups
+   before deciding whether there is work, and create a `.bak-<ts>` only when a
+   change will actually be written.
+54. Arm cold-backup restart recovery before invoking `docker compose stop`.
+   The current guard is armed only after stop returns success, so an interrupt
+   during stop can leave some or all services down without EXIT recovery.
+   Track `stop_attempted` separately from `stopped_successfully`, arm the guard
+   before the stop command, perform a best-effort start after any attempted
+   stop, and use only `stopped_successfully` for archive consistency and
+   metrics.
+55. Add tests for the init writer and suggestion safety. Current Phase 7 init
+   tests cover only `--check`; add create/reconcile cases for one dated block,
+   shell-safe quoting, `.bak-<ts>`, suggestion-only writes, duplicate
+   avoidance, and proof that heuristic bind/hot suggestions are not accepted
+   without explicit consent. Extend failure tests for interruption during stop
+   and the separate attempted/successful stop states.
+
+## Should fix — IMPLEMENTED 2026-09-20
+
+56. Correct stop-policy observability on failed runs. Validation failure
+   currently emits `docker_backup_stack_stopped=0` and appears HOT, while stop
+   failure emits `1` although no valid archive exists. Emit achieved
+   consistency only for a valid archive, or split configured policy from
+   achieved archive consistency, and make failed/no-archive states explicit in
+   the dashboard.
+57. Gate the local-only retention message on a valid archive. The current branch
+   can say an archive was retained and report target success after stop/tar
+   failure removed or never produced the archive. Keep zero-target success
+   semantics, but log the retained path only when `archive_ok=1`; otherwise
+   report delivery as skipped because no valid archive exists.
+58. Validate the new config values during load. Require `LOCAL_ONLY` to be
+   exactly `true` or `false`, and require `NO_STOP_STACKS` to be an indexed
+   array. Fail early with a clear config error instead of silently treating a
+   typo such as `TRUE` as remote-delivery mode.
+59. Make reconcile output truthful when only `GONE` entries exist. It currently
+   warns about gone stacks and then says the config is "in sync" because only
+   `UNMANAGED` controls the early return. Report that no additions are
+   available and stale entries require manual removal.
+60. Treat a missing config as drift in `docker-backup-init.sh --check`, even
+   when no stateful stack is currently running, because `docker-backup.sh`
+   itself cannot run without that file. Add a no-config/no-project test.
+
+## Follow-up acceptance criteria
+
+1. `--write` may still add objective `STACKS` drift non-interactively, but it
+   never adds `BIND_IGNORE` or `NO_STOP_STACKS` guesses without a separate,
+   explicit consent mechanism.
+2. Suggestion-only reconciliation works, writes one dated block, creates one
+   backup only when changing the config, and does not append duplicates.
+3. A signal or stop failure during the cold path triggers a best-effort start;
+   hot stacks never arm the guard or call stop/start.
+4. Metrics and logs distinguish configured hot policy, successful cold archive,
+   failed stop, failed archive, and local-only delivery skipped for lack of an
+   archive.
+5. Invalid Phase 7 config values fail before any stack is stopped or any target
+   is contacted.
+6. `--check` exits 1 for a missing config and for unmanaged/gone drift, and its
+   normal reconcile report never labels a config with gone entries as in sync.
+7. Focused regression tests, `tests/run_all.sh`, `bash -n`, and ShellCheck all
+   pass after the follow-up work is implemented.

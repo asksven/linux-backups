@@ -54,11 +54,24 @@ self_update() {
 }
 
 # -----------------------------------------------------------------------------
-# Source a secrets file (exports DEST_URL, SAS_TOKEN, PROM_GTW, ...). Errors and
-# exits if the file is missing or unreadable.
+# Source a secrets file (exports DEST_URL, SAS_TOKEN, PROM_GTW, ...).
+# Args: <secrets file> [optional]
+# Default: errors and exits if the file is missing or unreadable.
+# "optional": a MISSING file logs INFO and returns 1 instead of exiting (for
+#   LOCAL_ONLY setups with no delivery/metrics credentials); a file that
+#   EXISTS but is unreadable is still fatal in both modes -- that is a
+#   permissions misconfiguration, not an intentional local-only setup.
 # -----------------------------------------------------------------------------
 load_secrets() {
-  local secrets="$1"
+  local secrets="$1" mode="${2:-required}"
+  if [[ ! -e "$secrets" ]]; then
+    if [[ "$mode" == "optional" ]]; then
+      log INFO "secrets file not found: $secrets (continuing without it)"
+      return 1
+    fi
+    log ERROR "secrets file not found or unreadable: $secrets"
+    exit 1
+  fi
   if [[ ! -r "$secrets" ]]; then
     log ERROR "secrets file not found or unreadable: $secrets"
     exit 1
@@ -619,6 +632,31 @@ bind_include_netfs() {
     _bind_match "$src" "$pat" && return 0
   done
   return 1
+}
+
+# Sets STOP_POLICY to "no-stop" if <stack> matches a NO_STOP_STACKS entry
+# (exact project name or glob, matched with the same _bind_match used for
+# BIND_IGNORE), "stop" otherwise. If the caller has declared an associative
+# array NO_STOP_STACKS_HITS, the matching index is recorded there (used by
+# docker-backup.sh/docker-backup-init.sh to warn about stale entries that
+# matched nothing in a run). Sets a global rather than printing so that hit-
+# tracking side effect is never lost to a command-substitution subshell (see
+# bind_capture_verdict below, which the same pitfall motivated).
+STOP_POLICY=""
+# shellcheck disable=SC2034
+stack_stop_policy() {
+  local stack="$1" i entry
+  STOP_POLICY="stop"
+  for i in "${!NO_STOP_STACKS[@]}"; do
+    entry="${NO_STOP_STACKS[$i]}"
+    [[ -n "$entry" ]] || continue
+    if _bind_match "$stack" "$entry"; then
+      # shellcheck disable=SC2004
+      declare -p NO_STOP_STACKS_HITS &>/dev/null && NO_STOP_STACKS_HITS[$i]=1
+      STOP_POLICY="no-stop"
+      return 0
+    fi
+  done
 }
 
 # Classify a single bind-mount source using the canonical 5-rule precedence

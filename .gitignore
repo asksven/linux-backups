@@ -15,3 +15,4 @@ conf/targets/*.conf
 *.tar.gz
 *.log
 output.txt
+srv-1

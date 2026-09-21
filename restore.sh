@@ -104,6 +104,14 @@ manifest_schema() {
   echo "${s:-1}"
 }
 
+# Print "true", "false", or empty (field absent -- schema predates the stop
+# policy, or the archive was always taken stop-cold-copy) for
+# consistency.stopped.
+manifest_consistency_stopped() {
+  grep -oE '"consistency"[[:space:]]*:[[:space:]]*\{[^}]*"stopped"[[:space:]]*:[[:space:]]*(true|false)' <<< "$MANIFEST" \
+    | grep -oE '(true|false)$' || true
+}
+
 # Print all volume names from the manifest's volumes[] array.
 manifest_volume_names() {
   grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]*"' <<< "$MANIFEST" \
@@ -547,6 +555,10 @@ main() {
   node="$(manifest_scalar node)"
   working_dir="$(manifest_scalar working_dir)"
   log INFO "archive: node='${node}' stack='${stack}' schema=${schema}"
+
+  if [[ "$(manifest_consistency_stopped)" == "false" ]]; then
+    log WARNING "archive was taken HOT (consistency.stopped=false): the stack was left running during backup, so restored data may be crash-consistent only, not a clean stop-cold-copy snapshot"
+  fi
 
   # --- Volumes (all schemas) ---
   restore_volumes
