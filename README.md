@@ -42,18 +42,22 @@ backup so a node is fully restorable.
 
 ## Per-server setup
 
-1. **Clone the repo** somewhere stable, e.g.:
+1. **Clone the repo** somewhere stable, e.g. `/opt/linux-backups`, and `cd`
+   into it — the remaining commands in this README are run from the repo root
+   and use relative paths (`./backup.sh`, ...); adjust them if you invoke a
+   script from elsewhere:
 
    ```bash
    sudo git clone https://github.com/<you>/linux-backups.git /opt/linux-backups
+   cd /opt/linux-backups
    ```
 
 2. **Create the config directory** and drop in your config + secrets:
 
    ```bash
    sudo mkdir -p /etc/linux-backups
-   sudo cp /opt/linux-backups/conf/example.conf   /etc/linux-backups/backup.conf
-   sudo cp /opt/linux-backups/secrets.env.example /etc/linux-backups/secrets.env
+   sudo cp conf/example.conf   /etc/linux-backups/backup.conf
+   sudo cp secrets.env.example /etc/linux-backups/secrets.env
    sudo chmod 600 /etc/linux-backups/secrets.env
    sudoedit /etc/linux-backups/backup.conf      # set paths, retention, node name
    sudoedit /etc/linux-backups/secrets.env      # set DEST_URL, SAS_TOKEN, PROM_GTW
@@ -62,7 +66,7 @@ backup so a node is fully restorable.
 3. **Test it** without uploading:
 
    ```bash
-   sudo DRY_RUN=1 /opt/linux-backups/backup.sh
+   sudo DRY_RUN=1 ./backup.sh
    ```
 
    `DRY_RUN=1` skips both the self-update and the `azcopy` upload, but still
@@ -91,15 +95,35 @@ backup so a node is fully restorable.
 
 ### Testing a branch
 
-To try changes from a non-default branch on a single host, pass `--branch`:
+To try changes from a non-default branch on a single host, pass `--branch`
+(or set `BACKUP_BRANCH`) — this applies identically to `backup.sh` and
+`docker-backup.sh`, which share the same self-update mechanism. The default,
+with neither set, is always `main`:
 
 ```bash
-sudo /opt/linux-backups/backup.sh --branch my-test-branch
+sudo ./backup.sh --branch my-test-branch
+sudo ./docker-backup.sh --branch my-test-branch
 ```
 
 The script hard-resets its checkout to `origin/<branch>` before running. If git
 is unreachable (offline), it logs a warning and continues with the current local
 version — a backup is never skipped because of a failed update.
+
+**Pass `--branch` (or set `BACKUP_BRANCH`) on every invocation for as long as
+you're testing that branch — including cron/scheduled runs.** Self-update
+resets to `origin/main` by default; a single manual run with `--branch
+my-test-branch` does not "stick" for the next run. If a cron entry (or any
+other invocation) omits it, that run hard-resets the checkout back to `main`,
+silently discarding the branch's changes mid-testing. Either add `--branch` to
+every cron line using that branch (or export `BACKUP_BRANCH=my-test-branch`
+for the whole crontab/environment), or set `NO_SELF_UPDATE=1` to freeze the
+checkout entirely while you work.
+
+`docker-backup-init.sh` has no `--branch` flag and does **not** self-update at
+all — it only ever runs whatever is currently checked out. If you're testing
+on a branch, keep it in sync yourself (`git checkout <branch> && git pull`)
+before running it; otherwise it can silently drift out of sync with
+`lib.sh`/`docker-backup.sh` and produce misleading output.
 
 ## Backup targets
 
@@ -136,8 +160,8 @@ fanned out to every target under `<node>/docker/<stack>/`).
 probes every enabled target and prints a pass/fail table (no backup is made):
 
 ```bash
-sudo /opt/linux-backups/backup.sh --check-targets
-sudo /opt/linux-backups/docker-backup.sh --check-targets
+sudo ./backup.sh --check-targets
+sudo ./docker-backup.sh --check-targets
 ```
 
 For **azure** it uploads a tiny `.healthcheck` probe blob (the only way to verify
@@ -327,7 +351,8 @@ Create `$CONFIG_DIR/docker-backup.conf` from the template (**independent** of
 `backup.conf` — no host backup required):
 
 ```bash
-sudo cp /opt/linux-backups/conf/docker-backup.example.conf /etc/linux-backups/docker-backup.conf
+sudo mmdir -p /etc/linux-backups
+sudo cp conf/docker-backup.example.conf /etc/linux-backups/docker-backup.conf
 sudoedit /etc/linux-backups/docker-backup.conf   # set STACKS, retention, STOP_TIMEOUT
 ```
 
@@ -389,10 +414,10 @@ review a suggestion before adding it.
 is read-only and is safe to schedule (see below):
 
 ```bash
-sudo /opt/linux-backups/docker-backup-init.sh            # interactive
-sudo /opt/linux-backups/docker-backup-init.sh --print    # report only, no changes
-sudo /opt/linux-backups/docker-backup-init.sh --write    # apply STACKS suggestions non-interactively
-sudo /opt/linux-backups/docker-backup-init.sh --check    # drift check only; exit 0/1, no changes
+sudo ./docker-backup-init.sh            # interactive
+sudo ./docker-backup-init.sh --print    # report only, no changes
+sudo ./docker-backup-init.sh --write    # apply STACKS suggestions non-interactively
+sudo ./docker-backup-init.sh --check    # drift check only; exit 0/1, no changes
 ```
 
 With no config it offers to create one from the discovered stacks. With an
@@ -414,7 +439,7 @@ applies them on their own. Add `--apply-bind-ignore` and/or
 interactive mode; `--print` only ever prints them:
 
 ```bash
-sudo /opt/linux-backups/docker-backup-init.sh --write --apply-bind-ignore --apply-stop-policy
+sudo ./docker-backup-init.sh --write --apply-bind-ignore --apply-stop-policy
 ```
 
 `--check` reports the same running-but-unmanaged / configured-but-gone drift as
@@ -423,7 +448,10 @@ sync — suitable for cron/CI in addition to the `DockerBackupUnmanagedStack` al
 
 ### Scheduling
 
-Give the compose backup its own cron entry (it self-updates like `backup.sh`):
+Give the compose backup its own cron entry (it self-updates like `backup.sh`,
+defaulting to `main` — see [Testing a branch](#testing-a-branch) if you're
+running this node on a non-default branch; the same `--branch`/`BACKUP_BRANCH`
+line must be added to the cron entry too, not just an ad-hoc invocation):
 
 ```cron
 SHELL=/bin/bash
@@ -436,7 +464,7 @@ PATH=/usr/local/bin:/usr/bin:/bin
 Test it without stopping anything or uploading:
 
 ```bash
-sudo DRY_RUN=1 /opt/linux-backups/docker-backup.sh
+sudo DRY_RUN=1 ./docker-backup.sh
 ```
 
 `DRY_RUN=1` discovers stacks, classifies bind mounts, and pushes metrics — it does
@@ -513,17 +541,17 @@ A node-level group (`instance="<node>"`, no `stack`) carries
 
 ```bash
 # Full DR restore: named volumes + compose files + bind data
-sudo /opt/linux-backups/restore.sh /var/backups/linux-backups/docker/srv-1-immich-2026-07-19-03-00.tar.gz
+sudo ./restore.sh /var/backups/linux-backups/docker/srv-1-immich-2026-07-19-03-00.tar.gz
 
 # Restore to a different project directory and remapped bind-root
-sudo /opt/linux-backups/restore.sh <archive> --project-dir /opt/stacks/immich --bind-root /restore
+sudo ./restore.sh <archive> --project-dir /opt/stacks/immich --bind-root /restore
 
 # Restore volumes only (skip compose files and bind data)
-sudo /opt/linux-backups/restore.sh <archive> --no-compose --no-binds
+sudo ./restore.sh <archive> --no-compose --no-binds
 
 # Overwrite existing non-empty volumes, or restore only specific volumes
-sudo /opt/linux-backups/restore.sh <archive> --force
-sudo /opt/linux-backups/restore.sh <archive> --volume immich_pgdata
+sudo ./restore.sh <archive> --force
+sudo ./restore.sh <archive> --volume immich_pgdata
 ```
 
 `restore.sh` reads `manifest.json`, recreates each named volume, extracts its
@@ -556,7 +584,7 @@ updated in lockstep.
 
   ```bash
   sudo mkdir -p /etc/linux-backups/targets
-  sudo install -m 600 /opt/linux-backups/conf/targets/azure.example.conf \
+  sudo install -m 600 conf/targets/azure.example.conf \
       /etc/linux-backups/targets/azure.conf
   # move DEST_URL / SAS_TOKEN from secrets.env into azure.conf, then optionally
   # add /etc/linux-backups/targets/onsite.conf (TYPE=rsync) for a second target.

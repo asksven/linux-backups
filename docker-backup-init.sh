@@ -372,8 +372,21 @@ apply_append() {
   _append_suggestion_block "$conf" "$@"
 }
 
+# Refuse to run as non-root: otherwise $CONFIG_DIR may not be readable, and a
+# config that exists but can't be read is indistinguishable from no config at
+# all -- silently producing wrong drift/suggestion output instead of failing
+# loudly. A separate function (rather than inline in main) so tests can stub
+# it the same way they already stub require_docker.
+require_root() {
+  if [[ $EUID -ne 0 ]]; then
+    log ERROR "must be run as root (sudo)"
+    exit 1
+  fi
+}
+
 main() {
   parse_args "$@"
+  require_root
   require_docker
 
   local conf="$CONFIG_DIR/docker-backup.conf"
@@ -479,6 +492,7 @@ main() {
 
   echo "Reconciliation report:"
   echo "  managed stacks: ${STACKS[*]:-<none>}"
+  echo "  hot backup stacks (NO_STOP_STACKS): ${NO_STOP_STACKS[*]:-<none>}"
   echo "  running but UNMANAGED (own volumes or bind-mount state): ${UNMANAGED[*]:-<none>}"
   echo "  configured but GONE (down/renamed?): ${GONE[*]:-<none>}"
   echo "  project details (volume & bind sizes):"
