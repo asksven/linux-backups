@@ -52,6 +52,22 @@ backup so a node is fully restorable.
    cd /opt/linux-backups
    ```
 
+   **If you use an SSH remote instead** (`git@github.com:...`), pre-seed
+   **root's** known_hosts before scheduling anything — self-update runs as
+   whatever user cron/systemd runs the script as (typically root), and each
+   user account needs its own SSH host-key trust the first time it connects.
+   Skip this if a run as that user has never happened yet: it will otherwise
+   hit `git fetch`'s interactive "authenticity of host ... can't be
+   established" prompt, and since cron has no terminal to answer it,
+   self-update silently fails every run (logged as a `WARNING`, not fatal —
+   the backup itself still runs — but the checkout never updates) until this
+   is done:
+
+   ```bash
+   sudo mkdir -p /root/.ssh
+   sudo ssh-keyscan github.com | sudo tee -a /root/.ssh/known_hosts
+   ```
+
 2. **Create the config directory** and drop in your config + secrets:
 
    ```bash
@@ -467,8 +483,10 @@ Test it without stopping anything or uploading:
 sudo DRY_RUN=1 ./docker-backup.sh
 ```
 
-`DRY_RUN=1` discovers stacks, classifies bind mounts, and pushes metrics — it does
-**not** stop stacks, build archives, or upload.
+`DRY_RUN=1` skips both the self-update and stop/tar/upload — it only discovers
+stacks, classifies bind mounts, and pushes metrics. Because self-update is
+skipped entirely, `--branch`/`BACKUP_BRANCH` is irrelevant here and can be
+omitted even while testing a branch.
 
 ### Scheduling a drift check
 
