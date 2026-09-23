@@ -177,7 +177,11 @@ discovered).
   an `ERROR` and `STACK_ALL_TARGETS_OK=0`, since that usually indicates a
   misconfiguration. A local-only host with no `secrets.env` also has no
   `PROM_GTW`, so metrics pushes are skipped (see Metrics below) — ship a
-  `secrets.env` with just `PROM_GTW` set to keep the dashboard populated.
+  `secrets.env` with just `PROM_GTW` set to keep the dashboard populated, and
+  `chmod 600` it: `cp`/`touch`/an editor save can silently re-create the file
+  under the process umask (commonly world-readable) instead of preserving a
+  restrictive mode. `load_secrets()` logs a `WARNING` every run if the file
+  is readable by group/other, but does not fix it.
 
 ## Restore (`restore.sh`)
 

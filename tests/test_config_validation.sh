@@ -143,4 +143,43 @@ EOF
   rm -rf "$work"
 }
 
+test_load_config_warns_on_world_readable_secrets_env() {
+  local work; work="$(mktemp -d)"
+  _setup "$work"
+  chmod 644 "$CONFIG_DIR/secrets.env"
+  cat > "$CONFIG_DIR/docker-backup.conf" <<'EOF'
+LOCAL_ONLY=true
+EOF
+
+  local logged=""
+  # shellcheck disable=SC2317
+  log() { logged+="$*"$'\n'; }
+
+  load_config
+
+  assert_contains "$logged" "readable by group/other" "a group/other-readable secrets.env (holds live credentials) is flagged with a WARNING"
+  assert_contains "$logged" "chmod 600" "the warning tells the operator exactly how to fix it"
+
+  rm -rf "$work"
+}
+
+test_load_config_no_warning_for_strict_secrets_env_permissions() {
+  local work; work="$(mktemp -d)"
+  _setup "$work"
+  chmod 600 "$CONFIG_DIR/secrets.env"
+  cat > "$CONFIG_DIR/docker-backup.conf" <<'EOF'
+LOCAL_ONLY=true
+EOF
+
+  local logged=""
+  # shellcheck disable=SC2317
+  log() { logged+="$*"$'\n'; }
+
+  load_config
+
+  assert_not_contains "$logged" "readable by group/other" "a strictly-permissioned (600) secrets.env is not flagged"
+
+  rm -rf "$work"
+}
+
 run_tests

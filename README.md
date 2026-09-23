@@ -79,6 +79,13 @@ backup so a node is fully restorable.
    sudoedit /etc/linux-backups/secrets.env      # set DEST_URL, SAS_TOKEN, PROM_GTW
    ```
 
+   `secrets.env` holds live credentials (`SAS_TOKEN`, `PROM_GTW`), so re-run
+   `chmod 600` after any later `cp`/`touch`/editor save that re-creates the
+   file -- none of those preserve permissions, and a plain `cp` in particular
+   applies the current umask instead (commonly `644`, world-readable). Every
+   run also checks this and logs a `WARNING` if the file is readable by
+   group/other, so a lapse won't go unnoticed, but it isn't fixed for you.
+
 3. **Test it** without uploading:
 
    ```bash
@@ -392,7 +399,9 @@ Without `LOCAL_ONLY=true`, a missing `secrets.env` is still a fatal
 misconfiguration (it may hold target credentials the run depends on). With no
 `secrets.env` at all, `PROM_GTW` is also unset, so metrics pushes are skipped
 (logged, not an error) — if you still want the Pushgateway dashboard on a
-local-only host, ship a `secrets.env` containing just `PROM_GTW=...`.
+local-only host, ship a `secrets.env` containing just `PROM_GTW=...` and
+`chmod 600` it (a plain redirect/`touch` creates it with the process umask,
+typically world-readable).
 
 ### Per-stack stop policy (hot vs stop-cold-copy)
 

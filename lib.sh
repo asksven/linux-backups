@@ -54,6 +54,17 @@ self_update() {
 }
 
 # -----------------------------------------------------------------------------
+# Return 0 if <path>'s permission bits grant any access to group or other
+# (i.e. more permissive than owner-only). Portable BSD/GNU stat, matching the
+# idiom already used by tests/harness.sh's assert_mode.
+_is_group_or_other_readable() {
+  local path="$1" mode
+  mode="$(stat -f '%Lp' "$path" 2>/dev/null || stat -c '%a' "$path" 2>/dev/null)"
+  [[ -n "$mode" ]] || return 1
+  [[ "$mode" == *00 ]] && return 1
+  return 0
+}
+
 # Source a secrets file (exports DEST_URL, SAS_TOKEN, PROM_GTW, ...).
 # Args: <secrets file> [optional]
 # Default: errors and exits if the file is missing or unreadable.
@@ -75,6 +86,13 @@ load_secrets() {
   if [[ ! -r "$secrets" ]]; then
     log ERROR "secrets file not found or unreadable: $secrets"
     exit 1
+  fi
+  # Not fatal -- a bad mode here is a hardening lapse, not a reason to skip a
+  # backup -- but this file holds live credentials (SAS_TOKEN, PROM_GTW), so
+  # warn loudly and every run until it's fixed (a `cp`, `touch`, or editor
+  # save can silently re-create it under the process umask instead of 600).
+  if _is_group_or_other_readable "$secrets"; then
+    log WARNING "$secrets is readable by group/other; it holds credentials -- run: chmod 600 $secrets"
   fi
   # shellcheck disable=SC1090
   source "$secrets"
