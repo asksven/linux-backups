@@ -167,7 +167,7 @@ test_main_refuses_to_run_as_non_root() {
   rm -rf "$work"
 }
 
-test_check_warns_on_world_readable_secrets_env() {
+test_check_fails_hard_on_world_readable_secrets_env() {
   local work; work="$(mktemp -d)"
   load_docker_backup_init "$work"
   # shellcheck disable=SC2317
@@ -187,14 +187,14 @@ EOF
   : > "$CONFIG_DIR/secrets.env"
   chmod 644 "$CONFIG_DIR/secrets.env"
 
-  local logged=""
-  # shellcheck disable=SC2317
-  log() { logged+="$*"$'\n'; }
+  # main's exit 1 would otherwise terminate this test's own subshell before
+  # assert_status runs -- wrap it like the non-root test above.
+  local output rc=0
+  output="$( ( main --check ) 2>&1 )" || rc=$?
 
-  main --check || true
-
-  assert_contains "$logged" "readable by group/other" "docker-backup-init.sh also flags a world-readable secrets.env, even though it never sources it"
-  assert_contains "$logged" "chmod 600" "the warning tells the operator exactly how to fix it"
+  assert_status "$rc" "1" "docker-backup-init.sh also refuses to run against a world-readable secrets.env, even though it never sources it"
+  assert_contains "$output" "readable by group/other" "the error explains why it refused"
+  assert_contains "$output" "chmod 600" "the error tells the operator exactly how to fix it"
 
   rm -rf "$work"
 }

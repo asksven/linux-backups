@@ -87,12 +87,14 @@ load_secrets() {
     log ERROR "secrets file not found or unreadable: $secrets"
     exit 1
   fi
-  # Not fatal -- a bad mode here is a hardening lapse, not a reason to skip a
-  # backup -- but this file holds live credentials (SAS_TOKEN, PROM_GTW), so
-  # warn loudly and every run until it's fixed (a `cp`, `touch`, or editor
-  # save can silently re-create it under the process umask instead of 600).
+  # This file holds live credentials (SAS_TOKEN, PROM_GTW). A `cp`, `touch`,
+  # or editor save can silently re-create it under the process umask instead
+  # of 600 -- refuse to proceed rather than risk running with an exposed
+  # credential unnoticed; the operator must consciously fix the mode (or
+  # rotate the credentials if they may already have been exposed) and re-run.
   if _is_group_or_other_readable "$secrets"; then
-    log WARNING "$secrets is readable by group/other; it holds credentials -- run: chmod 600 $secrets"
+    log ERROR "$secrets is readable by group/other; it holds credentials -- run: chmod 600 $secrets (and rotate the credentials if they may already have been exposed)"
+    exit 1
   fi
   # shellcheck disable=SC1090
   source "$secrets"

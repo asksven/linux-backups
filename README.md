@@ -83,8 +83,10 @@ backup so a node is fully restorable.
    `chmod 600` after any later `cp`/`touch`/editor save that re-creates the
    file -- none of those preserve permissions, and a plain `cp` in particular
    applies the current umask instead (commonly `644`, world-readable). Every
-   run also checks this and logs a `WARNING` if the file is readable by
-   group/other, so a lapse won't go unnoticed, but it isn't fixed for you.
+   run **refuses to proceed** (`ERROR`, exit 1) if the file is readable by
+   group/other, rather than silently running with an exposed credential --
+   fix the mode (or rotate the credentials if they may already have been
+   exposed) and re-run.
 
 3. **Test it** without uploading:
 
@@ -400,8 +402,9 @@ misconfiguration (it may hold target credentials the run depends on). With no
 `secrets.env` at all, `PROM_GTW` is also unset, so metrics pushes are skipped
 (logged, not an error) — if you still want the Pushgateway dashboard on a
 local-only host, ship a `secrets.env` containing just `PROM_GTW=...` and
-`chmod 600` it (a plain redirect/`touch` creates it with the process umask,
-typically world-readable).
+`chmod 600` it: a plain redirect/`touch` creates it under the process umask
+(typically world-readable), and every run refuses to proceed against a
+group/other-readable `secrets.env`.
 
 ### Per-stack stop policy (hot vs stop-cold-copy)
 

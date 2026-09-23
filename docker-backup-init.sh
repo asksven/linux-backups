@@ -390,12 +390,13 @@ main() {
   require_docker
 
   # This tool never sources secrets.env (it only ever writes a hint about it),
-  # so load_secrets()'s runtime permission check never runs for it either --
-  # check independently, since this is often the first/only tool run on a
-  # freshly-provisioned host.
+  # so load_secrets()'s permission check never runs for it either -- check
+  # independently and refuse to proceed, since this is often the first/only
+  # tool run on a freshly-provisioned host.
   local secrets="$CONFIG_DIR/secrets.env"
   if [[ -e "$secrets" ]] && _is_group_or_other_readable "$secrets"; then
-    log WARNING "$secrets is readable by group/other; it holds credentials -- run: chmod 600 $secrets"
+    log ERROR "$secrets is readable by group/other; it holds credentials -- run: chmod 600 $secrets (and rotate the credentials if they may already have been exposed)"
+    exit 1
   fi
 
   local conf="$CONFIG_DIR/docker-backup.conf"

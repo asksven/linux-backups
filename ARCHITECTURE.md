@@ -180,8 +180,9 @@ discovered).
   `secrets.env` with just `PROM_GTW` set to keep the dashboard populated, and
   `chmod 600` it: `cp`/`touch`/an editor save can silently re-create the file
   under the process umask (commonly world-readable) instead of preserving a
-  restrictive mode. `load_secrets()` logs a `WARNING` every run if the file
-  is readable by group/other, but does not fix it.
+  restrictive mode. `load_secrets()` refuses to run (`ERROR`, exit 1) if the
+  file is readable by group/other, rather than running with a possibly-
+  exposed credential.
 
 ## Restore (`restore.sh`)
 

@@ -21,6 +21,9 @@ _setup() {
   CONFIG_DIR="$work/config"
   mkdir -p "$CONFIG_DIR"
   : > "$CONFIG_DIR/secrets.env"
+  # The umask-default mode load_config now rejects; permission-specific tests
+  # chmod it explicitly to whatever they want to assert on.
+  chmod 600 "$CONFIG_DIR/secrets.env"
 }
 
 test_load_config_rejects_invalid_local_only_value() {
@@ -143,7 +146,7 @@ EOF
   rm -rf "$work"
 }
 
-test_load_config_warns_on_world_readable_secrets_env() {
+test_load_config_fails_hard_on_world_readable_secrets_env() {
   local work; work="$(mktemp -d)"
   _setup "$work"
   chmod 644 "$CONFIG_DIR/secrets.env"
@@ -151,19 +154,20 @@ test_load_config_warns_on_world_readable_secrets_env() {
 LOCAL_ONLY=true
 EOF
 
-  local logged=""
-  # shellcheck disable=SC2317
-  log() { logged+="$*"$'\n'; }
+  # load_config -> load_secrets calls exit directly on an insecure mode; run
+  # it inside a command substitution so only that inner shell exits, not this
+  # test function's own subshell (same gotcha as the missing-secrets tests).
+  local output rc=0
+  output="$( ( load_config ) 2>&1 )" || rc=$?
 
-  load_config
-
-  assert_contains "$logged" "readable by group/other" "a group/other-readable secrets.env (holds live credentials) is flagged with a WARNING"
-  assert_contains "$logged" "chmod 600" "the warning tells the operator exactly how to fix it"
+  assert_status "$rc" "1" "a group/other-readable secrets.env (holds live credentials) refuses to run rather than just warning"
+  assert_contains "$output" "readable by group/other" "the error explains why it refused"
+  assert_contains "$output" "chmod 600" "the error tells the operator exactly how to fix it"
 
   rm -rf "$work"
 }
 
-test_load_config_no_warning_for_strict_secrets_env_permissions() {
+test_load_config_no_error_for_strict_secrets_env_permissions() {
   local work; work="$(mktemp -d)"
   _setup "$work"
   chmod 600 "$CONFIG_DIR/secrets.env"
@@ -183,3 +187,4 @@ EOF
 }
 
 run_tests
+
