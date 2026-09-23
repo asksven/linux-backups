@@ -179,6 +179,13 @@ pushgateway_post() {
     return 1
   fi
   local url="${PROM_GTW%/}/metrics/${label_path}"
+  # Every caller builds its body via "$(cat <<EOF ... EOF)", and command
+  # substitution strips ALL trailing newlines -- the Prometheus text-format
+  # parser requires the last line to end in \n, so an unterminated body is
+  # rejected with "400: unexpected end of input stream" (confirmed against
+  # the real gateway, lab-1 infra-1, 2026-09-23). Restore it here once for
+  # every caller rather than requiring each one to remember it.
+  [[ "$body" == *$'\n' ]] || body+=$'\n'
   if printf '%s' "$body" | curl --fail --silent --show-error --data-binary @- "$url"; then
     log INFO "metrics pushed to $url"
   else
