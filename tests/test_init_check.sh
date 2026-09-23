@@ -167,4 +167,36 @@ test_main_refuses_to_run_as_non_root() {
   rm -rf "$work"
 }
 
+test_check_warns_on_world_readable_secrets_env() {
+  local work; work="$(mktemp -d)"
+  load_docker_backup_init "$work"
+  # shellcheck disable=SC2317
+  discover_compose_projects() { printf 'sonarr\n'; }
+  # shellcheck disable=SC2317
+  stack_is_stateful() { [[ "$1" == "sonarr" ]]; }
+  # shellcheck disable=SC2317
+  require_docker() { :; }
+  # shellcheck disable=SC2317
+  require_root() { :; }
+
+  CONFIG_DIR="$work/config"
+  mkdir -p "$CONFIG_DIR"
+  cat > "$CONFIG_DIR/docker-backup.conf" <<'EOF'
+STACKS=( "sonarr" )
+EOF
+  : > "$CONFIG_DIR/secrets.env"
+  chmod 644 "$CONFIG_DIR/secrets.env"
+
+  local logged=""
+  # shellcheck disable=SC2317
+  log() { logged+="$*"$'\n'; }
+
+  main --check || true
+
+  assert_contains "$logged" "readable by group/other" "docker-backup-init.sh also flags a world-readable secrets.env, even though it never sources it"
+  assert_contains "$logged" "chmod 600" "the warning tells the operator exactly how to fix it"
+
+  rm -rf "$work"
+}
+
 run_tests
