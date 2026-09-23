@@ -168,6 +168,16 @@ pushgateway_post() {
     log WARNING "curl not found; cannot push metrics"
     return 0
   fi
+  # A bare host (no scheme) makes curl default to http://, and if the real
+  # endpoint redirects http->https (common behind a reverse proxy), `curl
+  # --fail` treats that 3xx as success and never sends the POST body --
+  # metrics silently never reach the gateway while the log says "pushed".
+  # Refuse rather than risk that false-success; this is a real incident we
+  # hit (lab-1 infra-1, 2026-09-23).
+  if [[ ! "$PROM_GTW" =~ ^https?:// ]]; then
+    log WARNING "PROM_GTW ('$PROM_GTW') has no http:// or https:// scheme -- skipping push rather than risk a silent false-success (see comment in pushgateway_post). Set PROM_GTW=\"https://...\" in secrets.env."
+    return 1
+  fi
   local url="${PROM_GTW%/}/metrics/${label_path}"
   if printf '%s' "$body" | curl --fail --silent --show-error --data-binary @- "$url"; then
     log INFO "metrics pushed to $url"
