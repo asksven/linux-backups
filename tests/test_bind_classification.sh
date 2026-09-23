@@ -121,4 +121,14 @@ test_classify_stack_binds_excluded_dedup() {
   rm -rf "$work"
 }
 
+test_root_bind_is_ephemeral_not_captured() {
+  # shellcheck source=/dev/null
+  source "$REPO_ROOT/lib.sh"
+
+  assert_status "$(_is_ephemeral_bind "/"; echo $?)" "0" \
+    "the whole host root (e.g. node-exporter's '- /:/host:ro') is never per-stack state"
+  assert_status "$(_is_ephemeral_bind "/etc"; echo $?)" "1" \
+    "a real subtree of root is not swept in by the '/' exclusion"
+}
+
 run_tests

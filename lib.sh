@@ -560,6 +560,14 @@ stack_has_bind_mounts() {
 _is_ephemeral_bind() {
   local src="$1"
   case "$src" in
+    # The whole host root (e.g. node-exporter's `- /:/host:ro`) is a host
+    # observability mount, never per-stack state -- and capturing it would
+    # walk /proc, /sys, and DOCKER_BACKUP_DIR itself (tar reading its own
+    # output mid-write). It also makes dir_size_human's `du -sh` recurse the
+    # entire host filesystem (crossing into every other mount, since du has
+    # no -x here) just to report a size, which is what caused the multi-
+    # minute pause during `docker-backup-init.sh --print`.
+    /) return 0 ;;
     /var/run/docker.sock|/run/docker.sock) return 0 ;;
     /etc/localtime|/etc/timezone|/etc/hosts|/etc/resolv.conf|/etc/hostname) return 0 ;;
     /proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/run|/run/*) return 0 ;;
